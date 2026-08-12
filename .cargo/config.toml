@@ -1,7 +1,7 @@
 [alias]
 lint = "clippy --all-targets --all-features -- -D warnings"
 
-miri-test = "miri test"
+miri-test = "miri test -- --skip ui::"
 
 [env]
 MIRIFLAGS = "-Zmiri-disable-isolation"
