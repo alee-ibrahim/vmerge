@@ -9,8 +9,16 @@ Build:
 cargo build --release
 ```
 
-The binary is `target/release/vmerge.exe`; a copy sits in the project root as
-`MERGE-VIDEOS.exe`, which is the drag-and-drop target.
+The binary is `target/release/vmerge.exe`. Copy it to the project root as
+`MERGE-VIDEOS.exe` to get a friendly drag-and-drop target:
+
+```
+copy target\release\vmerge.exe MERGE-VIDEOS.exe
+```
+
+The built exe is deliberately not committed — it changes on every build, so
+tracking it would grow the history with each commit. The vendored ffmpeg archive
+is committed because it changes once or twice a year.
 
 ffmpeg is found in `PATH`, in an `ffmpeg\bin` folder beside the executable, or
 in `%LOCALAPPDATA%\video-merge`. If none of those has it, it is downloaded and
@@ -18,8 +26,8 @@ unpacked on first run — no admin rights, nothing installed system-wide. Both
 steps report themselves, using the same eighth-block bar as the merge screen:
 
 ```
-  Downloading ffmpeg from gyan.dev - this happens once
-  ████████████████▊───────   58%   19.0 MB / 32.8 MB   220 KB/s   1:04 left
+  Downloading ffmpeg from this project's mirror - this happens once
+  ████████████████▊───────   58%   19.0 MB / 32.8 MB   14.3 MB/s   0:01 left
   Unpacking...
   ████████████████████████  100%   184.2 MB / 184.2 MB
 ```
@@ -34,22 +42,42 @@ prints a line every 25% instead of a bar it cannot draw.
 
 ffmpeg.org publishes no Windows binaries of its own; its download page points at
 two third-party builders, [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and
-[BtbN](https://github.com/BtbN/FFmpeg-Builds/releases). Measured from a
-~250 KB/s connection:
+[BtbN](https://github.com/BtbN/FFmpeg-Builds/releases). All four sources below
+were measured from the same ~250 KB/s connection:
 
-| Source | Size | |
-| --- | --- | --- |
-| gyan.dev `.7z` | **32.8 MB** | what we use — about 2.5 minutes |
-| gyan.dev `.zip` | 106.1 MB | fallback — identical binaries, about 7 minutes |
-| BtbN on GitHub | 170.3 MB | last resort — its asset host is unreachable on some networks |
+| Source | Size | Throughput | Wall clock |
+| --- | --- | --- | --- |
+| **this repo's mirror** | **32.8 MB** | **14.3 MB/s** | **2.3 s** |
+| gyan.dev `.7z` | 32.8 MB | 211 KB/s | ~2.5 min |
+| gyan.dev `.zip` | 106.1 MB | 268 KB/s | ~6.8 min |
+| BtbN on GitHub | 170.3 MB | *0 — unreachable* | never finishes |
 
-The 7z holds the same build as the zip, packed with LZMA instead of deflate, so
-it is a third of the bytes for byte-identical executables. Sources are tried in
-order, and one only counts as good once its archive has *unpacked* — so a 7z
-that will not decode falls back to the zip rather than failing setup.
+The mirror is not faster because of anything clever: it is the same 32.8 MB
+archive served from GitHub's code hosts, which reach 9–14 MB/s from here while
+gyan.dev manages 250 KB/s. The catch is that GitHub's *release-asset* host
+(`objects.githubusercontent.com`) returns nothing at all on this network — the
+same reason BtbN never completes — so the archive lives in the repository tree
+and is fetched over `raw.githubusercontent.com` rather than attached to a
+release.
 
-Only `ffmpeg.exe` and `ffprobe.exe` are kept. `ffplay.exe` is another 104 MB and
-nothing here ever invokes it, so the installed folder is 196 MB rather than 300.
+The mirror is pinned by SHA-256, so a corrupted or swapped file is rejected
+before anything is unpacked and setup falls through to upstream. Upstream is not
+hash-checked, because its contents change with every ffmpeg release. `.7z` is
+preferred over `.zip` because it is the same build in a third of the bytes.
+
+Sources are tried in order, and one only counts as good once its archive has
+*unpacked* — so a 7z that will not decode falls back to the zip rather than
+failing setup. Upstream stays in the list so the tool keeps working if this
+repository is ever renamed, made private, or unreachable.
+
+Only `ffmpeg.exe` and `ffprobe.exe` are written. `ffplay.exe` is another 104 MB
+and nothing here ever invokes it, and the rest of the archive is documentation
+and presets — so 196 MB lands on disk out of 307 MB unpacked. A solid 7z block
+still has to be *decompressed* to reach later entries, but it does not have to be
+*written*, and skipping those writes took a clean first run from 29 s to 19 s.
+
+End to end, a first run is now about **19 seconds**: 2.3 s to fetch 32.8 MB, the
+rest to unpack it.
 
 `FFmpeg/FFmpeg` on GitHub is source only: no releases, no binary assets. Using
 it would mean compiling ffmpeg and libx264 on the user's machine.

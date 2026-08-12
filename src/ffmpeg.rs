@@ -273,6 +273,22 @@ fn extract_binaries(
     collect_binaries(stage, target_bin)
 }
 
+/// The only entries worth putting on disk.
+///
+/// The archive unpacks to about 417 MB, of which we keep 205: ffplay alone is
+/// 104 MB and is never invoked, and the rest is documentation and presets. A
+/// solid 7z block still has to be *decompressed* in order to reach later
+/// entries, but it does not have to be *written*, and skipping the writes is
+/// most of the wait on a slow disk.
+fn is_wanted(name: &Path) -> bool {
+    let Some(leaf) = name.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    [exe_name("ffmpeg"), exe_name("ffprobe")]
+        .iter()
+        .any(|wanted| leaf.eq_ignore_ascii_case(wanted))
+}
+
 /// Writes one entry, refusing any path that would climb out of `stage`.
 ///
 /// A downloaded archive is untrusted input: an entry named `..\..\evil.exe`
@@ -282,9 +298,14 @@ fn write_entry(stage: &Path, name: &Path, data: &mut dyn Read) -> Result<u64> {
     let safe = name.components().all(|part| {
         matches!(part, std::path::Component::Normal(_) | std::path::Component::CurDir)
     });
-    if !safe {
-        return Ok(0);
+
+    // Unwanted and unsafe entries are both drained rather than skipped: in a
+    // solid archive the bytes have to be read to reach whatever comes next, and
+    // the progress bar counts them either way.
+    if !safe || !is_wanted(name) {
+        return std::io::copy(data, &mut std::io::sink()).context("reading the archive");
     }
+
     let out = stage.join(name);
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -313,7 +334,6 @@ fn unpack_7z(archive_path: &Path, stage: &Path, reporter: &mut dyn Reporter) -> 
         .for_each_entries(|entry, data| {
             let path = PathBuf::from(entry.name.replace('\\', "/"));
             if entry.is_directory {
-                let _ = fs::create_dir_all(stage.join(&path));
                 return Ok(true);
             }
             match write_entry(stage, &path, data) {
@@ -361,8 +381,6 @@ fn unpack_zip(archive_path: &Path, stage: &Path, reporter: &mut dyn Reporter) ->
             continue;
         };
         if entry.is_dir() {
-            let out = stage.join(&relative);
-            fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
             continue;
         }
         written += write_entry(stage, &relative, &mut entry)?;
@@ -622,6 +640,15 @@ mod tests {
         assert!(
             !target_bin.join(exe_name("ffplay")).is_file(),
             "ffplay is 104 MB and never invoked, so it must not be copied"
+        );
+        // Nor should anything unwanted have been written on the way through.
+        assert!(
+            !dir.join("stage").join("ffmpeg-7.1-essentials").join("README.txt").is_file(),
+            "entries we do not need must be drained, not written to disk"
+        );
+        assert!(
+            !dir.join("stage").join("ffmpeg-7.1-essentials").join("bin").join(exe_name("ffplay")).is_file(),
+            "ffplay must not be written even to the staging folder"
         );
         assert_eq!(fs::metadata(&installed).unwrap().len(), 2048, "copied whole");
 
