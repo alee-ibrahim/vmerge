@@ -73,15 +73,20 @@ were measured from the same ~250 KB/s connection:
 | **this repo's mirror** | **32.8 MB** | **14.3 MB/s** | **2.3 s** |
 | gyan.dev `.7z` | 32.8 MB | 211 KB/s | ~2.5 min |
 | gyan.dev `.zip` | 106.1 MB | 268 KB/s | ~6.8 min |
-| BtbN on GitHub | 170.3 MB | *0 — unreachable* | never finishes |
+| BtbN on GitHub | 170.3 MB | *repeatedly 0* | did not finish |
 
 The mirror is not faster because of anything clever: it is the same 32.8 MB
-archive served from GitHub's code hosts, which reach 9–14 MB/s from here while
-gyan.dev manages 250 KB/s. The catch is that GitHub's *release-asset* host
-(`objects.githubusercontent.com`) returns nothing at all on this network — the
-same reason BtbN never completes — so the archive lives in the repository tree
-and is fetched over `raw.githubusercontent.com` rather than attached to a
-release.
+archive served from GitHub's code hosts, which reach 9–14 MB/s from the
+connection this was measured on, while gyan.dev manages 250 KB/s.
+
+The archive lives in the repository tree and is fetched over
+`raw.githubusercontent.com` rather than being attached to a release, because
+GitHub's *release-asset* host proved unreliable on that connection: three
+consecutive attempts returned nothing at all, and a later attempt succeeded
+completely. Intermittent is worse than slow for a first-run bootstrap — setup
+that fails half the time is setup that cannot be trusted — whereas the code
+hosts were fast on every attempt. It is likely the same reason the 170 MB BtbN
+download never completed.
 
 The mirror is pinned by SHA-256, so a corrupted or swapped file is rejected
 before anything is unpacked and setup falls through to upstream. Upstream is not
