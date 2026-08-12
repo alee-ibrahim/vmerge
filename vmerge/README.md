@@ -1,7 +1,7 @@
 # Video Merger (Rust + Ratatui)
 
-Joins video clips into one `.mp4`. A port of `merge-videos.ps1` with a real
-terminal UI: arrow-key selection, in-place reordering, and live progress bars.
+Joins video clips into one `.mp4` with a real terminal UI: arrow-key selection,
+in-place reordering, and live progress bars.
 
 Build:
 

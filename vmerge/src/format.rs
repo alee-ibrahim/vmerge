@@ -1,4 +1,4 @@
-//! Formatting helpers, ported from the console helpers in merge-videos.ps1.
+//! Formatting helpers for console display.
 
 /// Human-readable byte count. Mirrors Format-Size.
 pub fn size(bytes: u64) -> String {
