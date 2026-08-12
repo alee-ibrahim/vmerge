@@ -15,6 +15,20 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+/// A transfer rate, e.g. "4.3 MB/s".
+pub fn rate(bytes_per_second: f64) -> String {
+    if !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+        return "--".into();
+    }
+    const MB: f64 = 1024.0 * 1024.0;
+    const KB: f64 = 1024.0;
+    if bytes_per_second >= MB {
+        format!("{:.1} MB/s", bytes_per_second / MB)
+    } else {
+        format!("{:.0} KB/s", bytes_per_second / KB)
+    }
+}
+
 /// HH:MM:SS, or "unknown" for a duration ffprobe could not report.
 pub fn duration(seconds: f64) -> String {
     if seconds <= 0.0 || !seconds.is_finite() {

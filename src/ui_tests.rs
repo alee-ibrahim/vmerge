@@ -70,7 +70,7 @@ fn render(app: &App, width: u16, height: u16) -> String {
 fn empty_list_asks_for_files() {
     let (app, _rx) = app_with(vec![]);
     let screen = render(&app, 100, 30);
-    assert!(screen.contains("DRAG YOUR VIDEO FILES"), "got:\n{screen}");
+    assert!(screen.contains("DROP YOUR CLIPS HERE"), "got:\n{screen}");
     assert!(screen.contains("START MERGE"));
 }
 
@@ -86,7 +86,7 @@ fn clip_table_shows_each_clip_and_the_plan() {
     assert!(screen.contains("1920×1080"), "dimensions use a multiplication sign");
     // Mixed sizes, so the plan has to name the conversion target. The 4K clip
     // carries most of the footage here, so it wins.
-    assert!(screen.contains("Convert to 3840x2160"), "got:\n{screen}");
+    assert!(screen.contains("Convert to 3840×2160"), "got:\n{screen}");
     assert!(screen.contains("need converting"));
 }
 
@@ -130,7 +130,7 @@ fn every_overlay_renders() {
 
     app.menu_target();
     let screen = render(&app, 100, 30);
-    assert!(screen.contains("Auto") && screen.contains("1280x720"), "got:\n{screen}");
+    assert!(screen.contains("Auto") && screen.contains("1280×720"), "got:\n{screen}");
 
     app.overlay = Overlay::Confirm(Confirm::Overwrite(PathBuf::from("C:/clips/merged.mp4")));
     assert!(render(&app, 100, 30).contains("ALREADY EXISTS"));
@@ -415,6 +415,73 @@ fn the_mouse_button_advertises_what_it_will_do() {
     assert!(render(&app, 100, 30).contains("mouse on"), "offers to turn it back on");
 }
 
+/// Strip every colour and the screen must still say the same things.
+///
+/// This is the check the previous design would have failed: it leaned on colour
+/// to tell the selected row, the marked rows and the primary action apart. Here
+/// the cursor is a solid bar, a mark is a bullet, and the shapes survive.
+#[test]
+fn hierarchy_survives_monochrome() {
+    let (mut app, _rx) = app_with(vec![
+        clip("one.mp4", 1920, 1080, 30.0, 5.0),
+        clip("two.mp4", 1280, 720, 25.0, 5.0),
+        clip("three.mp4", 1920, 1080, 30.0, 5.0),
+    ]);
+    app.cursor = 1;
+    app.clips[2].marked = true;
+
+    // Render with the plain palette, then throw the palette away entirely: only
+    // the characters are left.
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let mut ui = UiState {
+        theme: crate::theme::Theme::new(crate::theme::Tier::Ansi),
+        ..Default::default()
+    };
+    terminal.draw(|frame| draw(frame, &app, &mut ui)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect();
+    let screen = rows.join("\n");
+
+    // The cursor is a shape, not a colour.
+    let cursor_row = rows.iter().find(|r| r.contains("two.mp4")).expect("the clip is listed");
+    assert!(
+        cursor_row.contains(crate::theme::glyph::CURSOR),
+        "the selected row needs a visible marker without colour:\n{screen}"
+    );
+    let other_row = rows.iter().find(|r| r.contains("one.mp4")).unwrap();
+    assert!(
+        !other_row.contains(crate::theme::glyph::CURSOR),
+        "an unselected row must not carry the cursor marker"
+    );
+
+    // So is a mark, and it is a different shape from the cursor.
+    let marked_row = rows.iter().find(|r| r.contains("three.mp4")).unwrap();
+    assert!(
+        marked_row.contains(crate::theme::glyph::MARK),
+        "a marked row needs its own marker without colour:\n{screen}"
+    );
+    assert_ne!(
+        crate::theme::glyph::MARK,
+        crate::theme::glyph::CURSOR,
+        "focus and marking must not be the same shape"
+    );
+
+    // The primary action still reads as one thing, spaced apart from the rest.
+    assert!(screen.contains(" S START MERGE "), "got:\n{screen}");
+
+    // And the data is all still there.
+    for expected in ["one.mp4", "two.mp4", "three.mp4", "1920×1080", "OUTPUT", "PLAN"] {
+        assert!(screen.contains(expected), "{expected:?} vanished without colour:\n{screen}");
+    }
+}
+
 /// A fallback pass has to start the rows over. When the fast join fails after
 /// remuxing every clip, the retry used to inherit those finished rows and open
 /// at nearly 100% before doing any of the work.
@@ -480,9 +547,15 @@ fn dump_screens() {
 {}", render(&app, 96, 26));
     app.close_overlay();
 
+    app.toggle_help();
+    println!("
+=== key reference ===
+{}", render(&app, 96, 26));
+    app.close_overlay();
+
     app.screen = Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
     app.handle_event(AppEvent::Merge(MergeEvent::Plan(
-        "Common format: 1920x1080 @ 30 fps, H.264 + AAC stereo 48000 Hz".into(),
+        "Common format: 1920×1080 @ 30 fps, H.264 + AAC stereo 48000 Hz".into(),
     )));
     app.handle_event(AppEvent::Merge(MergeEvent::Plan(
         "2 of 4 clips are copied as they are; the other 2 get converted.".into(),

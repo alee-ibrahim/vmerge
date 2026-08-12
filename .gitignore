@@ -1,6 +1,12 @@
 target/
 ffmpeg/
 
+# The built binary. It changes on every build, so committing it grows history
+# on each commit; the vendored ffmpeg archive below is a one-off by comparison.
+MERGE-VIDEOS.exe
+*.exe
+!vendor/*.exe
+
 # Local media and merge outputs
 *.mp4
 *.mov

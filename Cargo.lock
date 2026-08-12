@@ -173,6 +173,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +221,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -807,6 +825,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
+ "block-padding",
  "hybrid-array",
 ]
 
@@ -959,6 +978,12 @@ checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
 dependencies = [
  "sha2 0.11.0",
 ]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
 
 [[package]]
 name = "mac_address"
@@ -1617,6 +1642,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sevenz-rust2"
+version = "0.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20acd38118edb830eb5a0bfacaf83c687b9995f48d6983cdac3cb18ce1d571cc"
+dependencies = [
+ "aes",
+ "bzip2",
+ "cbc",
+ "crc32fast",
+ "getrandom 0.4.3",
+ "js-sys",
+ "lzma-rust2 0.18.1",
+ "ppmd-rust",
+ "sha2 0.11.0",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2041,6 +2084,8 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sevenz-rust2",
+ "sha2 0.11.0",
  "ureq",
  "zip",
 ]
@@ -2332,7 +2377,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "indexmap",
- "lzma-rust2",
+ "lzma-rust2 0.16.5",
  "memchr",
  "pbkdf2",
  "ppmd-rust",

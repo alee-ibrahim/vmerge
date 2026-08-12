@@ -35,10 +35,10 @@ pub fn detect() -> Tier {
             _ => {}
         }
     }
-    if let Ok(colorterm) = std::env::var("COLORTERM") {
-        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
-            return Tier::True;
-        }
+    if let Ok(colorterm) = std::env::var("COLORTERM")
+        && (colorterm.contains("truecolor") || colorterm.contains("24bit"))
+    {
+        return Tier::True;
     }
     if std::env::var_os("WT_SESSION").is_some() {
         return Tier::True;

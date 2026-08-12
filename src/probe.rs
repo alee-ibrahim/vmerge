@@ -35,7 +35,7 @@ impl ClipInfo {
     }
 
     pub fn dimensions(&self) -> String {
-        format!("{}x{}", self.width, self.height)
+        format!("{}{}{}", self.width, crate::theme::glyph::TIMES, self.height)
     }
 }
 

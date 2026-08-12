@@ -1,0 +1,10 @@
+# Never let line-ending conversion near these: a single byte changed in the
+# vendored archive would break its pinned SHA-256 and corrupt the mirror.
+*.7z  binary
+*.zip binary
+*.exe binary
+
+# Keep Rust sources at LF regardless of platform.
+*.rs  text eol=lf
+*.md  text eol=lf
+*.toml text eol=lf

@@ -111,7 +111,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     frame.render_widget(Block::default().style(ui.theme.on_base()), area);
 
     match &app.screen {
-        Screen::Browse => draw_browse(frame, area, app, ui),
+        Screen::Browse => draw_browse(frame, app, ui, area),
         Screen::Merging(_) => draw_merging(frame, area, app, ui),
         Screen::Result(outcome) => draw_result(frame, area, outcome, ui),
     }
@@ -176,9 +176,9 @@ fn hint_bar(frame: &mut Frame, area: Rect, ui: &mut UiState, rows: &[&[Hint]]) {
         let y = area.y + row_index as u16;
 
         for item in row.iter() {
-            let (key_style, label_style, width) = if item.primary {
-                // One chip, drawn as a single filled run so it reads as a
-                // button rather than as a key plus some words.
+            if item.primary {
+                // Drawn as a single filled run, so it reads as one button
+                // rather than as a key followed by some words.
                 let text = format!(" {} {} ", item.key, item.label);
                 let width = text.chars().count() as u16;
                 spans.push(Span::styled(text, theme.primary_chip()));
@@ -188,12 +188,15 @@ fn hint_bar(frame: &mut Frame, area: Rect, ui: &mut UiState, rows: &[&[Hint]]) {
                 }
                 x += width + GAP;
                 continue;
-            } else if item.click.is_some() {
-                (theme.key(), theme.dim(), 0)
+            }
+
+            // Something that cannot be clicked is drawn a shade back, so the
+            // bar separates "what you can press" from "how to get around".
+            let (key_style, label_style) = if item.click.is_some() {
+                (theme.key(), theme.dim())
             } else {
-                (Style::default().fg(theme.faint).add_modifier(Modifier::BOLD), theme.label(), 0)
+                (Style::default().fg(theme.faint).add_modifier(Modifier::BOLD), theme.label())
             };
-            let _ = width;
 
             let key_width = item.key.chars().count() as u16;
             let label_width = item.label.chars().count() as u16;
@@ -218,6 +221,22 @@ fn clamp_width(width: u16, x: u16, area: Rect) -> u16 {
     width.min(area.width.saturating_sub(used))
 }
 
+/// The measure everything on a screen shares.
+///
+/// Capped, because on a 200-column terminal a full-width table pushes the name
+/// and the numbers so far apart that they stop reading as one row. A fixed
+/// measure with empty page beside it looks deliberate; a stretched one does not.
+fn page(area: Rect) -> Rect {
+    const MAX: u16 = 112;
+    Rect { width: area.width.min(MAX), ..area }
+}
+
+/// Windows paths with forward slashes in them are legal and look like a mistake.
+fn display_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) { text.replace('/', "\\") } else { text }
+}
+
 fn status_line(frame: &mut Frame, area: Rect, app: &App, ui: &UiState) {
     let Some((text, kind)) = &app.status else {
         return;
@@ -239,17 +258,26 @@ fn status_line(frame: &mut Frame, area: Rect, app: &App, ui: &UiState) {
 
 // --------------------------------------------------------------------- browse
 
-fn draw_browse(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
+fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect) {
+    let area = page(frame_area);
     let plan = app.plan_lines();
 
-    let [head, top_rule, list, mid_rule, info, hints, status] = Layout::vertical([
+    // The list hugs what it holds rather than stretching: four clips in a
+    // forty-row window should not sit in a thirty-row empty panel. It still
+    // takes everything available once there are enough clips to need it.
+    let wanted = if app.clips.is_empty() { 9 } else { app.clips.len() as u16 + 1 };
+    let fixed = 1 + 1 + 1 + (1 + plan.len() as u16) + 2 + 1;
+    let list_height = wanted.clamp(4, area.height.saturating_sub(fixed).max(4));
+
+    let [head, top_rule, list, mid_rule, info, hints, status, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(3),
+        Constraint::Length(list_height),
         Constraint::Length(1),
         Constraint::Length(1 + plan.len() as u16),
         Constraint::Length(2),
         Constraint::Length(1),
+        Constraint::Min(0),
     ])
     .areas(area);
 
@@ -347,7 +375,7 @@ impl Columns {
     const GAP: u16 = 2;
 
     fn for_width(width: u16) -> Self {
-        let mut columns = Self { cursor: 2, index: 3, name: 0, size: 11, fps: 6, codec: 10, length: 7 };
+        let mut columns = Self { cursor: 3, index: 3, name: 0, size: 11, fps: 6, codec: 10, length: 7 };
         let fixed = columns.cursor
             + columns.index
             + columns.size
@@ -429,6 +457,7 @@ fn draw_clip_list(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
         let codec = format!("{}{}{}", clip.video_codec, glyph::DOT, audio);
 
         lines.push(Line::from(vec![
+            Span::raw(" "),
             Span::styled(edge, edge_style),
             Span::styled(marker, if selected { marker_style.bg(theme.accent_wash) } else { marker_style }),
             Span::styled(format!("{:>w$}", index + 1, w = columns.index as usize), if selected { theme.selected() } else { theme.label() }),
@@ -477,7 +506,7 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, ui: &UiState, plan: &[Str
     let theme = &ui.theme;
     let output = app
         .resolved_output()
-        .map(|p| p.display().to_string())
+        .map(|p| display_path(&p))
         .unwrap_or_else(|| app.output_name.clone());
 
     // Uppercase labels throughout this block, matching OUTPUT and PLAN. It also
@@ -525,20 +554,26 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, ui: &UiState, plan: &[Str
 
 // -------------------------------------------------------------------- merging
 
-fn draw_merging(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
+fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState) {
     let Screen::Merging(view) = &app.screen else {
         return;
     };
+    let area = page(frame_area);
     let theme = ui.theme;
 
     let plan_rows = view.plan.len().min(2) as u16;
-    let [head, top_rule, plan_area, rows_area, bar_area, timing, hints] = Layout::vertical([
+    let fixed = 1 + 1 + plan_rows + 2 + 1 + 1;
+    let rows_height =
+        (view.rows.len() as u16).clamp(2, area.height.saturating_sub(fixed).max(2));
+
+    let [head, top_rule, plan_area, rows_area, bar_area, timing, _, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(plan_rows),
-        Constraint::Min(2),
-        Constraint::Length(2),
+        Constraint::Length(rows_height),
+        Constraint::Length(3),
         Constraint::Length(1),
+        Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -573,8 +608,12 @@ fn draw_merging(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
 
     // The overall bar, unboxed: a label line and the bar itself.
     let fraction = view.overall();
-    let [bar_label, bar_line] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(bar_area);
+    let [_, bar_label, bar_line] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(bar_area);
     let stage = if view.joining { "joining" } else { "preparing clips" };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -711,7 +750,8 @@ fn draw_segment_rows(frame: &mut Frame, area: Rect, view: &crate::app::MergeView
 
 // --------------------------------------------------------------------- result
 
-fn draw_result(frame: &mut Frame, area: Rect, outcome: &Outcome, ui: &mut UiState) {
+fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut UiState) {
+    let area = page(frame_area);
     let theme = ui.theme;
 
     let (word, tone) = if outcome.ok {
@@ -737,7 +777,7 @@ fn draw_result(frame: &mut Frame, area: Rect, outcome: &Outcome, ui: &mut UiStat
     };
 
     if outcome.ok {
-        field("FILE", outcome.output.display().to_string());
+        field("FILE", display_path(&outcome.output));
         field("SIZE", format::size(outcome.size));
         field("LENGTH", format::duration(outcome.out_duration));
         if let Some((w, h, fps)) = outcome.out_format {
@@ -945,7 +985,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
             vec![
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(path.display().to_string(), theme.body()),
+                    Span::styled(display_path(path), theme.body()),
                 ]),
                 Line::raw(""),
                 Line::from(vec![
@@ -988,33 +1028,58 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
 
 /// Everything the keyboard does, on demand. The hint bar carries the handful
 /// that get used constantly; this carries the rest.
+/// Two columns, because one is taller than most terminals.
 fn draw_help(frame: &mut Frame, area: Rect, help: &HelpSheet, ui: &mut UiState) {
     let theme = ui.theme;
-    let rows: u16 = help.groups.iter().map(|g| g.keys.len() as u16 + 2).sum();
-    let box_area = centred(area, 68, rows + 5);
+
+    // Split the groups so the two columns come out as even as they can.
+    let total: usize = help.groups.iter().map(|g| g.keys.len() + 2).sum();
+    let mut split = help.groups.len();
+    let mut running = 0;
+    for (i, group) in help.groups.iter().enumerate() {
+        running += group.keys.len() + 2;
+        if running * 2 >= total {
+            split = i + 1;
+            break;
+        }
+    }
+
+    let render_column = |groups: &[crate::app::HelpGroup]| -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for group in groups {
+            lines.push(Line::styled(group.title.to_uppercase(), theme.label()));
+            for (keys, what) in &group.keys {
+                // The key column is wide enough for the longest chord, with a
+                // gap: without it "home end  g G" ran into its description.
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{keys:<15}"), theme.key()),
+                    Span::styled(what.clone(), theme.dim()),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
+        lines
+    };
+
+    let left = render_column(&help.groups[..split]);
+    let right = render_column(&help.groups[split..]);
+    let rows = left.len().max(right.len()) as u16;
+
+    let box_area = centred(area, 100, rows + 5);
     let body = panel(frame, box_area, ui, "Keys", theme.accent);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for group in &help.groups {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(group.title.to_uppercase(), theme.label()),
-        ]));
-        for (keys, what) in &group.keys {
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(format!("{keys:<14}"), theme.key()),
-                Span::styled(what.clone(), theme.dim()),
-            ]));
-        }
-        lines.push(Line::raw(""));
-    }
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("esc or ? closes this", theme.label()),
-    ]));
+    let [columns_area, footer] =
+        Layout::vertical([Constraint::Length(rows), Constraint::Min(0)]).areas(body);
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .areas(indent(columns_area, 2));
 
-    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(Paragraph::new(left), left_area);
+    frame.render_widget(Paragraph::new(right), right_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled("esc or ? closes this", theme.label())),
+        indent(footer, 2),
+    );
 }
 
 #[cfg(test)]

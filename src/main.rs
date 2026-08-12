@@ -26,11 +26,11 @@ mod proc;
 mod theme;
 mod ui;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -149,10 +149,9 @@ fn real_main(args: Args) -> Result<bool> {
         }
     }
 
-    let tools = ffmpeg::resolve(&exe_dir, &search, !args.skip_ffmpeg_download, &mut |line| {
-        println!("  {line}");
-    })
-    .context("setting up ffmpeg")?;
+    let mut reporter = SetupReporter::new();
+    let tools = ffmpeg::resolve(&exe_dir, &search, !args.skip_ffmpeg_download, &mut reporter)
+        .context("setting up ffmpeg")?;
     let tools = Arc::new(tools);
 
     // Explicit files win; a list file is the same thing from a launcher script.
@@ -184,6 +183,115 @@ fn real_main(args: Args) -> Result<bool> {
     }
 
     run_tui(tools, root, files, &args)
+}
+
+/// Setup progress on the plain console, before the interactive screen exists.
+///
+/// A hundred-megabyte download with nothing but "Downloading..." on screen is
+/// indistinguishable from a hang, which is exactly what it looked like. The bar
+/// is the same eighth-block one the merge screen uses, so the two match.
+struct SetupReporter {
+    tty: bool,
+    started: Instant,
+    last_drawn: Option<Instant>,
+    /// Set once a bar has been drawn, so `finished` knows to end the line.
+    drawing: bool,
+    last_logged_percent: u64,
+}
+
+impl SetupReporter {
+    /// Redraw rate. Fast enough to look live, slow enough not to spend the
+    /// download flushing the console.
+    const REDRAW: Duration = Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self {
+            tty: io::stdout().is_terminal(),
+            started: Instant::now(),
+            last_drawn: None,
+            drawing: false,
+            last_logged_percent: 0,
+        }
+    }
+}
+
+impl ffmpeg::Reporter for SetupReporter {
+    fn log(&mut self, line: &str) {
+        self.finished();
+        println!("  {line}");
+    }
+
+    fn progress(&mut self, received: u64, total: Option<u64>) {
+        // The clock starts when the bytes do. Counting from program start would
+        // fold ffmpeg discovery into the rate and report it far too low.
+        if received == 0 {
+            self.started = Instant::now();
+            // Also reset the logged percentage: it was left at 100 by the
+            // download, so unpacking printed nothing at all in a log.
+            self.last_logged_percent = 0;
+        }
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.2 { received as f64 / elapsed } else { 0.0 };
+
+        if !self.tty {
+            // Redirected output gets a line every 25%, not a bar it cannot draw.
+            if let Some(total) = total {
+                let percent = received * 100 / total.max(1);
+                if percent >= self.last_logged_percent + 25 {
+                    self.last_logged_percent = percent - percent % 25;
+                    println!("  {}%  {}", self.last_logged_percent, format::size(received));
+                }
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let due = self.last_drawn.is_none_or(|last| now.duration_since(last) >= Self::REDRAW);
+        let complete = total.is_some_and(|total| received >= total);
+        if !due && !complete {
+            return;
+        }
+        self.last_drawn = Some(now);
+        self.drawing = true;
+
+        print!("\r{:<78}", progress_line(received, total, rate));
+        let _ = io::stdout().flush();
+    }
+
+    fn finished(&mut self) {
+        if self.drawing {
+            self.drawing = false;
+            self.last_drawn = None;
+            println!();
+        }
+    }
+}
+
+/// The download line, kept pure so it can be checked without a socket.
+fn progress_line(received: u64, total: Option<u64>, rate: f64) -> String {
+    match total {
+        Some(total) => {
+            let fraction = (received as f64 / total as f64).clamp(0.0, 1.0);
+            // On a slow link the wait is minutes, so say how many. Without a
+            // rate yet there is nothing honest to put here.
+            let left = if rate > 0.0 && received < total {
+                format!("   {} left", format::short_duration((total - received) as f64 / rate))
+            } else {
+                String::new()
+            };
+            format!(
+                "  {}  {:>3.0}%   {} / {}   {}{}",
+                theme::bar(fraction, 24),
+                fraction * 100.0,
+                format::size(received),
+                format::size(total),
+                format::rate(rate),
+                left
+            )
+        }
+        // No declared length, so there is nothing to be a fraction of.
+        None => format!("  {}   {}", format::size(received), format::rate(rate)),
+    }
 }
 
 fn banner() {
@@ -288,4 +396,40 @@ fn wait_for_key() {
     println!("  Press Enter to close this window...");
     let mut line = String::new();
     let _ = io::stdin().read_line(&mut line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_download_line_reports_the_numbers() {
+        let line = progress_line(20 * 1024 * 1024, Some(40 * 1024 * 1024), 4.5 * 1024.0 * 1024.0);
+        assert!(line.contains("50%"), "got {line:?}");
+        assert!(line.contains("20.0 MB / 40.0 MB"), "got {line:?}");
+        assert!(line.contains("4.5 MB/s"), "got {line:?}");
+        assert!(line.contains(theme::glyph::FULL), "expected a filled bar: {line:?}");
+        // 20 MB left at 4.5 MB/s is about 4 and a half seconds.
+        assert!(line.contains("left"), "a slow download needs an estimate: {line:?}");
+    }
+
+    #[test]
+    fn a_download_of_unknown_length_still_reports_bytes() {
+        // Some mirrors send no Content-Length, and a bar would be a lie.
+        let line = progress_line(3 * 1024 * 1024, None, 512.0 * 1024.0);
+        assert!(line.contains("3.0 MB"), "got {line:?}");
+        assert!(line.contains("512 KB/s"), "got {line:?}");
+        assert!(!line.contains('%'), "no percentage without a total: {line:?}");
+    }
+
+    #[test]
+    fn the_download_line_ends_at_a_hundred() {
+        let full = 40 * 1024 * 1024;
+        let line = progress_line(full, Some(full), 9.9 * 1024.0 * 1024.0);
+        assert!(line.contains("100%"), "got {line:?}");
+        // Overshooting a declared length must not produce 103%.
+        let over = progress_line(full + 4096, Some(full), 1.0);
+        assert!(over.contains("100%"), "got {over:?}");
+        assert!(!line.contains("left"), "nothing left to wait for at the end: {line:?}");
+    }
 }

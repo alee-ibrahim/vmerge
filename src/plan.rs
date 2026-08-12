@@ -31,7 +31,13 @@ pub struct Target {
 
 impl Target {
     pub fn label(&self) -> String {
-        format!("{}x{} @ {} fps", self.width, self.height, format::fps(self.fps))
+        format!(
+            "{}{}{} @ {} fps",
+            self.width,
+            crate::theme::glyph::TIMES,
+            self.height,
+            format::fps(self.fps)
+        )
     }
 
     pub fn channel_layout(&self) -> &'static str {

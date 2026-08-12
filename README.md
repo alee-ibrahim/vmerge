@@ -1,4 +1,4 @@
-# Video Merger (Rust + Ratatui)
+# vmerge
 
 Joins video clips into one `.mp4` with a real terminal UI: arrow-key selection,
 in-place reordering, and live progress bars.
@@ -14,7 +14,45 @@ The binary is `target/release/vmerge.exe`; a copy sits in the project root as
 
 ffmpeg is found in `PATH`, in an `ffmpeg\bin` folder beside the executable, or
 in `%LOCALAPPDATA%\video-merge`. If none of those has it, it is downloaded and
-unpacked on first run — no admin rights, nothing installed system-wide.
+unpacked on first run — no admin rights, nothing installed system-wide. Both
+steps report themselves, using the same eighth-block bar as the merge screen:
+
+```
+  Downloading ffmpeg from gyan.dev - this happens once
+  ████████████████▊───────   58%   19.0 MB / 32.8 MB   220 KB/s   1:04 left
+  Unpacking...
+  ████████████████████████  100%   184.2 MB / 184.2 MB
+```
+
+The size and the estimate come from the server rather than a number baked into
+the source: the figure inherited from the PowerShell claimed "about 40 MB" and
+the zip is 106. A transfer that stops short is caught there rather than
+surfacing later as a corrupt archive, and with output redirected each step
+prints a line every 25% instead of a bar it cannot draw.
+
+### Which build, and why
+
+ffmpeg.org publishes no Windows binaries of its own; its download page points at
+two third-party builders, [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and
+[BtbN](https://github.com/BtbN/FFmpeg-Builds/releases). Measured from a
+~250 KB/s connection:
+
+| Source | Size | |
+| --- | --- | --- |
+| gyan.dev `.7z` | **32.8 MB** | what we use — about 2.5 minutes |
+| gyan.dev `.zip` | 106.1 MB | fallback — identical binaries, about 7 minutes |
+| BtbN on GitHub | 170.3 MB | last resort — its asset host is unreachable on some networks |
+
+The 7z holds the same build as the zip, packed with LZMA instead of deflate, so
+it is a third of the bytes for byte-identical executables. Sources are tried in
+order, and one only counts as good once its archive has *unpacked* — so a 7z
+that will not decode falls back to the zip rather than failing setup.
+
+Only `ffmpeg.exe` and `ffprobe.exe` are kept. `ffplay.exe` is another 104 MB and
+nothing here ever invokes it, so the installed folder is 196 MB rather than 300.
+
+`FFmpeg/FFmpeg` on GitHub is source only: no releases, no binary assets. Using
+it would mean compiling ffmpeg and libx264 on the user's machine.
 
 ## Using it
 
@@ -34,6 +72,7 @@ order you dropped them.
 | `c` | clear the list |
 | `n` | sort by filename (1, 2, 10 — not 1, 10, 2) |
 | `m` | release/recapture the mouse |
+| `?` | the full key reference |
 | `s` | **start the merge** |
 | `o` | output file name |
 | `q` | quality |
@@ -87,6 +126,42 @@ MERGE-VIDEOS.exe --no-tui a.mp4 b.mp4 --quality small --encoder cpu
 
 An `order.txt` in the folder (one filename per line, `#` for comments) sets the
 order in one-shot mode.
+
+## The design
+
+Four rules, taken from how the TUIs that read well actually work:
+
+**Hierarchy survives monochrome.** Strip every colour and the screen still
+reads. The cursor is a solid bar `▌`, a mark is a bullet `●` — two different
+shapes, not two different colours — and the primary action is the only filled
+chip on screen. `hierarchy_survives_monochrome` renders with the palette
+stripped and asserts all of that, rather than trusting it.
+
+**Layers, not boxes.** Panels are a slightly lighter background between hairline
+rules. The first version was boxes inside boxes: every nested border spent two
+rows and two columns to say nothing, and the rounded corners were the loudest
+thing on screen.
+
+**Every cell counts.** Sizes, framerates and lengths are right-aligned in
+columns sized to their content, so they can be compared down the screen.
+Codec and audio share one column (`h264·aac`, `h264·—` when silent). The whole
+page is capped at 112 columns: on a 200-column terminal a full-width table
+pushes the name and the numbers so far apart they stop reading as one row.
+
+**One primary action, and hints in tiers.** `S START MERGE` is filled; the
+things you can click are a shade back; the things you can only press (`↑↓`,
+`⇧↑↓`) are a shade further back again. The full list lives behind `?` so the bar
+does not have to be a wall of twelve identical chips.
+
+Colour lives in `theme.rs` as semantic slots — `surface`, `accent`, `muted`,
+`good` — never as hex values at the call site. There are two palettes: 24-bit,
+and a sixteen-colour fallback that follows the terminal's own theme. Windows
+consoles have done 24-bit since Windows 10 1703, so that is the default;
+`VMERGE_COLORS=16` forces the plain one.
+
+Progress bars use eighth-width blocks (`█████▊───`), so a twenty-cell bar
+resolves 160 steps. Without the partial cell a slow clip looks stalled for
+seconds at a time.
 
 ## How the merge works
 
@@ -142,6 +217,7 @@ Each fallback says so on screen as it happens.
 - **Progress is terminal-aware.** Redirected output gets one line per clip
   rather than carriage-return litter.
 - **The mouse works** for selecting clips and pressing buttons.
+- **Redesigned throughout** — see the design section above.
 - **Refuses to write its output over one of its inputs.** The PowerShell would
   hand ffmpeg a file it was busy replacing, destroying the source and the result
   together.
@@ -155,7 +231,7 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-38 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+49 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
 what blocks the fast path) are covered directly, and every screen and overlay is
 rendered into a `TestBackend` and read back — including at terminal sizes down
 to 1x1, which is what catches a layout that would panic on a resize.

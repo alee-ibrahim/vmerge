@@ -101,11 +101,11 @@ impl HelpSheet {
                 group(
                     "The list",
                     vec![
-                        ("↑ ↓   j k", "move the cursor"),
-                        ("⇧↑ ⇧↓   J K", "move the selected clip"),
-                        ("home end   g G", "first, last"),
+                        ("↑ ↓  j k", "move the cursor"),
+                        ("⇧↑ ⇧↓  J K", "move the selected clip"),
+                        ("home end  g G", "first, last"),
                         ("space", "mark a clip"),
-                        ("del   d", "remove marked clips, or the selected one"),
+                        ("del   d", "remove marked, or selected"),
                         ("esc", "clear the marks"),
                     ],
                 ),
@@ -124,15 +124,15 @@ impl HelpSheet {
                         ("o", "output name"),
                         ("q", "quality"),
                         ("t", "target size and framerate"),
-                        ("e", "encoder: the GPU when possible, or always the CPU"),
-                        ("r", "force every clip through the encoder"),
+                        ("e", "GPU if possible, else CPU"),
+                        ("r", "force every clip re-encoded"),
                     ],
                 ),
                 group(
                     "Other",
                     vec![
-                        ("m", "release the mouse, so text can be selected"),
-                        ("x   ctrl+c", "exit"),
+                        ("m", "release the mouse for copying"),
+                        ("x  ctrl+c", "exit"),
                     ],
                 ),
             ],
@@ -506,7 +506,15 @@ impl App {
             .min_by_key(|c| c.width as u64 * c.height as u64)
             .expect("clips is not empty");
 
-        let describe = |c: &ClipInfo| format!("{}x{} @ {} fps", c.width, c.height, format::fps(c.fps));
+        let describe = |c: &ClipInfo| {
+            format!(
+                "{}{}{} @ {} fps",
+                c.width,
+                crate::theme::glyph::TIMES,
+                c.height,
+                format::fps(c.fps)
+            )
+        };
 
         let choices = vec![
             TargetChoice::Auto,
@@ -528,8 +536,8 @@ impl App {
             (format!("Auto - matches most of your footage: {}", auto.label()), String::new()),
             (format!("Biggest clip: {}", describe(biggest)), String::new()),
             (format!("Smallest clip - fastest: {}", describe(smallest)), String::new()),
-            ("1920x1080 @ 30 fps".to_string(), String::new()),
-            ("1280x720 @ 30 fps".to_string(), String::new()),
+            (format!("1920{}1080 @ 30 fps", crate::theme::glyph::TIMES), String::new()),
+            (format!("1280{}720 @ 30 fps", crate::theme::glyph::TIMES), String::new()),
             ("Type your own...".to_string(), "e.g. 1080x1920@25".into()),
         ];
 

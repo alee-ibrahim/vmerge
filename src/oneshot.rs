@@ -170,7 +170,11 @@ pub fn run(tools: Arc<Tools>, root: &Path, options: Options) -> Result<bool> {
         println!("  Size     : {}", format::size(outcome.size));
         println!("  Length   : {}", format::duration(outcome.out_duration));
         if let Some((w, h, fps)) = outcome.out_format {
-            println!("  Video    : {w}x{h} @ {} fps", format::fps(fps));
+            println!(
+                "  Video    : {w}{}{h} @ {} fps",
+                crate::theme::glyph::TIMES,
+                format::fps(fps)
+            );
         }
         println!("  Took     : {}", format::duration(outcome.elapsed));
     } else {
