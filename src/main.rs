@@ -356,7 +356,7 @@ fn run_tui(
             if dirty || matches!(app.screen, Screen::Merging(_)) {
                 terminal.draw(|frame| ui::draw(frame, &app, &mut ui_state))?;
             }
-            dirty = input::pump(&mut app, &ui_state, TICK)?;
+            dirty = input::pump(&mut app, &mut ui_state, TICK)?;
             while let Ok(event) = rx.try_recv() {
                 app.handle_event(event);
                 dirty = true;

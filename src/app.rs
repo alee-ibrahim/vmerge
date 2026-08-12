@@ -451,8 +451,8 @@ impl App {
         self.overlay = Overlay::Prompt(Prompt {
             kind: PromptKind::AddPaths,
             title: "Add clips".into(),
-            hint: "Drag files or a folder in, or paste a path. Enter to accept, Esc to cancel."
-                .into(),
+            // What to do, not which keys: the buttons underneath say that.
+            hint: "Drag files or a folder in, or paste a path.".into(),
             buffer: String::new(),
         });
     }

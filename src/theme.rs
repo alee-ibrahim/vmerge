@@ -56,6 +56,9 @@ pub struct Theme {
     pub surface: Color,
     /// A popup sitting on a panel, and the selected row.
     pub raised: Color,
+    /// A button face. One step above `raised`, so a chip reads as an object
+    /// sitting on the page rather than as text with a highlight behind it.
+    pub chip: Color,
     /// Hairline rules. Never a full border if a rule will do.
     pub line: Color,
 
@@ -92,6 +95,7 @@ impl Theme {
             base: Color::Rgb(0x0d, 0x10, 0x17),
             surface: Color::Rgb(0x14, 0x18, 0x21),
             raised: Color::Rgb(0x1b, 0x20, 0x2b),
+            chip: Color::Rgb(0x25, 0x2c, 0x3a),
             line: Color::Rgb(0x28, 0x2f, 0x3c),
             text: Color::Rgb(0xe6, 0xe9, 0xf0),
             muted: Color::Rgb(0x98, 0xa1, 0xb3),
@@ -110,6 +114,7 @@ impl Theme {
             base: Color::Reset,
             surface: Color::Reset,
             raised: Color::Blue,
+            chip: Color::DarkGray,
             line: Color::DarkGray,
             text: Color::White,
             muted: Color::Gray,
@@ -153,10 +158,40 @@ impl Theme {
         Style::default().fg(self.accent)
     }
 
-    /// The one primary action on any screen. Filled, so it is the first thing
-    /// the eye lands on and stays that way with colour removed.
-    pub fn primary_chip(&self) -> Style {
-        Style::default().bg(self.accent).fg(self.base).add_modifier(Modifier::BOLD)
+    /// A button, as the three styles one needs: the cap either side, the key,
+    /// and the label.
+    ///
+    /// `ground` is what the chip is sitting on, because the caps are half-cells
+    /// of the face colour and the other half has to match its surroundings.
+    /// `hot` is the pointer being over it: a terminal has no cursor to change,
+    /// so brightening the face is the only feedback available before the click.
+    pub fn chip(&self, kind: ChipKind, ground: Color, hot: bool) -> ChipStyle {
+        let face = match kind {
+            ChipKind::Button => self.chip,
+            ChipKind::Primary => self.accent,
+            ChipKind::Danger => self.warn,
+        };
+        let face = if hot { lift(face) } else { face };
+
+        // A filled chip is already the loudest thing on its row, so its key is
+        // told apart by weight rather than by a second colour on top.
+        let (key, label) = match kind {
+            ChipKind::Button => (
+                Style::default().bg(face).fg(self.accent).add_modifier(Modifier::BOLD),
+                Style::default().bg(face).fg(self.text),
+            ),
+            _ => {
+                let filled = Style::default().bg(face).fg(self.base).add_modifier(Modifier::BOLD);
+                (filled, filled)
+            }
+        };
+        ChipStyle { edge: Style::default().fg(face).bg(ground), key, label }
+    }
+
+    /// A clickable row under the pointer: the same brightening a chip gets, so
+    /// hover means one thing everywhere. `over` is the layer the row sits on.
+    pub fn hovered(&self, over: Color) -> Style {
+        Style::default().bg(lift(over)).fg(self.text)
     }
 
     /// A keyboard key in the hint bar.
@@ -178,6 +213,49 @@ impl Theme {
         };
         Style::default().fg(colour)
     }
+}
+
+/// How loud a button is. Exactly one `Primary` per screen; `Danger` is for the
+/// answer in a dialog that cannot be taken back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipKind {
+    Button,
+    Primary,
+    Danger,
+}
+
+/// The styles one button is drawn from.
+#[derive(Debug, Clone, Copy)]
+pub struct ChipStyle {
+    pub edge: Style,
+    pub key: Style,
+    pub label: Style,
+}
+
+/// A colour a step brighter, for whatever is under the pointer.
+///
+/// Proportional to the headroom left, so a near-white lifts a little and a dark
+/// face lifts a lot: a fixed step would either not show on one or blow out the
+/// other. Named colours have no components to work with, so they get their
+/// light variant instead.
+fn lift(colour: Color) -> Color {
+    match colour {
+        Color::Rgb(r, g, b) => Color::Rgb(lift_channel(r), lift_channel(g), lift_channel(b)),
+        Color::Black => Color::DarkGray,
+        Color::DarkGray => Color::Gray,
+        Color::Gray => Color::White,
+        Color::Red => Color::LightRed,
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::Cyan => Color::LightCyan,
+        other => other,
+    }
+}
+
+fn lift_channel(value: u8) -> u8 {
+    value.saturating_add((u32::from(255 - value) * 30 / 100) as u8)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +286,12 @@ pub mod glyph {
 
     /// Frames for the working indicator, in order.
     pub const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+    /// The ends of a button. Half a cell of the button's own colour, so a chip
+    /// stops in the middle of a cell instead of squaring off against the page -
+    /// which is what makes it read as an object rather than as a highlight.
+    pub const CAP_LEFT: &str = "▐";
+    pub const CAP_RIGHT: &str = "▌";
 
     /// Eighth-width blocks, so a bar can end part way through a cell and show
     /// progress finer than the character grid.

@@ -141,8 +141,11 @@ order you dropped them.
 ### Mouse
 
 Clicking works as well as typing: click a clip to select it, click any button in
-the bottom bar to run it, click a menu item to choose it, click the yes/no
-buttons on a dialog. The scroll wheel moves through the list and through menus.
+the bottom bar to run it, click a menu item to choose it, click an answer on a
+dialog, click the drop zone to add clips, click a prompt's `ADD THESE` to accept
+what you dropped in. Whatever is under the pointer lights up first, so you can
+see what a click will hit before making it. A picker or the key sheet also closes
+by clicking off it, and the scroll wheel moves through the list and through menus.
 
 Capturing the mouse takes the terminal's own text selection away, so `m`
 releases it when you want to copy something off the screen — the bottom-bar
@@ -204,10 +207,18 @@ Codec and audio share one column (`h264·aac`, `h264·—` when silent). The who
 page is capped at 112 columns: on a 200-column terminal a full-width table
 pushes the name and the numbers so far apart they stop reading as one row.
 
-**One primary action, and hints in tiers.** `S START MERGE` is filled; the
-things you can click are a shade back; the things you can only press (`↑↓`,
-`⇧↑↓`) are a shade further back again. The full list lives behind `?` so the bar
-does not have to be a wall of twelve identical chips.
+**One primary action, and a button that looks like one.** Everything clickable
+is a chip — `▐ q quality ▌` — padded, capped at both ends with half-blocks, lit
+a shade brighter under the pointer, and clickable across all of it, caps
+included. Exactly one chip per screen is filled: `S START MERGE`, or
+`A ADD CLIPS` in the drop zone while the list is empty. Things you can only
+press (`↑↓`, `⇧↑↓`) stay plain text, because a button nobody can click is worse
+than no button. Things with nothing to act on — `START MERGE` with an empty
+list — keep their words and their place but lose the face, so the answer arrives
+before the click rather than after it. The bar sits three rows deep with a blank
+row above it: buttons need the room their padding takes, and a toolbar pressed
+against the text above reads as one more line of that text. The full key list
+lives behind `?`.
 
 Colour lives in `theme.rs` as semantic slots — `surface`, `accent`, `muted`,
 `good` — never as hex values at the call site. There are two palettes: 24-bit,
@@ -287,7 +298,7 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-49 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+56 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
 what blocks the fast path) are covered directly, and every screen and overlay is
 rendered into a `TestBackend` and read back — including at terminal sizes down
 to 1x1, which is what catches a layout that would panic on a resize.
@@ -295,4 +306,7 @@ to 1x1, which is what catches a layout that would panic on a resize.
 The mouse tests are worth keeping honest: they find a label on the rendered
 screen and click the middle of it, so if the hit-region arithmetic ever drifts
 away from what the spans actually occupy, a button stops matching its label and
-a test fails.
+a test fails. One goes further and clicks a button's outermost cells, because a
+single cell of disagreement between a chip's drawn width and its hit region
+shifts every button after it along the row — drift the middle of a label is wide
+enough to hide.

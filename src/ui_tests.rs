@@ -354,6 +354,134 @@ fn the_bottom_bar_buttons_match_their_labels() {
     }
 }
 
+/// The whole button is the target, caps included.
+///
+/// `chip_width` and the spans it places have to agree exactly. They cannot be
+/// checked by clicking labels alone: one cell of disagreement moves every hit
+/// region after the first, so the drift only shows at the ends of a row.
+#[test]
+fn a_button_is_clickable_right_up_to_its_edges() {
+    let (app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+
+    // The last chip on its row, so it has accumulated any drift from the ones
+    // before it.
+    let chip = "▐ x exit ▌";
+    let row = row_of(&app, 100, 30, chip);
+    let screen = render(&app, 100, 30);
+    let left = column_of(screen.lines().nth(row as usize).unwrap(), chip);
+    let right = left + chip.chars().count() as u16 - 1;
+
+    for column in [left, left + 1, right - 1, right] {
+        assert_eq!(
+            click_at(&app, 100, 30, column, row),
+            Some(Click::Command('x')),
+            "column {column} is part of the button drawn from {left} to {right}"
+        );
+    }
+    assert_eq!(
+        click_at(&app, 100, 30, left - 1, row),
+        None,
+        "the gap between two buttons belongs to neither"
+    );
+    assert_eq!(click_at(&app, 100, 30, right + 1, row), None, "nor does the gap after one");
+}
+
+/// Hover is the only feedback a terminal can give before the click lands.
+#[test]
+fn a_button_lights_up_under_the_pointer() {
+    let (app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+    let (column, row) = centre_of(&app, 100, 30, "output");
+
+    let face = |pointer: Option<(u16, u16)>| {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut ui = UiState::default();
+        if let Some((c, r)) = pointer {
+            ui.set_pointer(c, r);
+        }
+        terminal.draw(|frame| draw(frame, &app, &mut ui)).unwrap();
+        terminal.backend().buffer()[(column, row)].bg
+    };
+
+    assert_ne!(
+        face(Some((column, row))),
+        face(None),
+        "the button under the pointer has to look different from the same button cold"
+    );
+    assert_eq!(
+        face(Some((column, row + 1))),
+        face(None),
+        "and a pointer on another row must leave it alone"
+    );
+}
+
+/// Rows are clickable, so they light up too: hover has to mean one thing
+/// everywhere, or it teaches nothing.
+#[test]
+fn a_clip_row_lights_up_under_the_pointer() {
+    let (app, _rx) = app_with(vec![
+        clip("one.mp4", 1920, 1080, 30.0, 5.0),
+        clip("two.mp4", 1920, 1080, 30.0, 5.0),
+    ]);
+    // Not the row under the cursor: that one carries its own wash already.
+    let row = row_of(&app, 100, 30, "two.mp4");
+
+    let face = |pointer: Option<(u16, u16)>| {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut ui = UiState::default();
+        if let Some((c, r)) = pointer {
+            ui.set_pointer(c, r);
+        }
+        terminal.draw(|frame| draw(frame, &app, &mut ui)).unwrap();
+        terminal.backend().buffer()[(30, row)].bg
+    };
+
+    assert_ne!(face(Some((30, row))), face(None), "the row under the pointer");
+    assert_eq!(face(Some((30, row + 1))), face(None), "any other row");
+}
+
+/// Buttons with nothing to act on are drawn dead rather than answering a click
+/// with a complaint.
+#[test]
+fn buttons_with_nothing_to_act_on_cannot_be_pressed() {
+    let (empty, _rx) = app_with(vec![]);
+    let screen = render(&empty, 100, 30);
+
+    for label in ["START MERGE", "mark", "remove", "clear"] {
+        assert!(screen.contains(label), "{label:?} still has to be listed:\n{screen}");
+        let (column, row) = centre_of(&empty, 100, 30, label);
+        assert_eq!(
+            click_at(&empty, 100, 30, column, row),
+            None,
+            "{label:?} has no clips to work on, so clicking it must do nothing"
+        );
+    }
+    // Adding some is the exception, and the drop zone is a button for it too.
+    let (column, row) = centre_of(&empty, 100, 30, "ADD CLIPS");
+    assert_eq!(click_at(&empty, 100, 30, column, row), Some(Click::Command('a')));
+
+    // With clips loaded, the same buttons come back to life.
+    let (loaded, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+    let (column, row) = centre_of(&loaded, 100, 30, "START MERGE");
+    assert_eq!(click_at(&loaded, 100, 30, column, row), Some(Click::Command('s')));
+}
+
+/// Buttons need air above them, or they read as one more line of the panel they
+/// are sitting under.
+#[test]
+fn the_button_bar_is_not_pressed_against_the_text_above_it() {
+    let (app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+    let screen = render(&app, 100, 30);
+    let lines: Vec<&str> = screen.lines().collect();
+    let buttons = row_of(&app, 100, 30, "START MERGE") as usize;
+
+    assert!(buttons > 0);
+    assert!(
+        lines[buttons - 1].trim().is_empty(),
+        "the row above the buttons has to be blank, got {:?}",
+        lines[buttons - 1]
+    );
+}
+
 #[test]
 fn menu_items_are_clickable_where_they_are_drawn() {
     let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
@@ -395,14 +523,60 @@ fn an_open_dialog_swallows_clicks_meant_for_what_is_behind_it() {
 }
 
 #[test]
-fn the_confirm_dialog_has_yes_and_no_buttons() {
+fn the_confirm_dialog_has_a_button_per_outcome() {
     let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
     app.overlay = Overlay::Confirm(Confirm::Overwrite(PathBuf::from("C:/clips/merged.mp4")));
 
+    // Three outcomes here, all of them different: overwrite, write a second
+    // file, or merge nothing at all.
     let (yes, row) = centre_of(&app, 100, 30, "overwrite it");
     let (no, _) = centre_of(&app, 100, 30, "write alongside it");
+    let (out, _) = centre_of(&app, 100, 30, "do not merge");
     assert_eq!(click_at(&app, 100, 30, yes, row), Some(Click::Answer(true)));
     assert_eq!(click_at(&app, 100, 30, no, row), Some(Click::Answer(false)));
+    assert_eq!(click_at(&app, 100, 30, out, row), Some(Click::Cancel));
+
+    // Stopping a merge has two, and Esc means the same as one of them, so it
+    // does not get a button of its own.
+    app.overlay = Overlay::Confirm(Confirm::CancelMerge);
+    let (stop, row) = centre_of(&app, 100, 30, "stop it");
+    let (keep, _) = centre_of(&app, 100, 30, "keep going");
+    assert_eq!(click_at(&app, 100, 30, stop, row), Some(Click::Answer(true)));
+    assert_eq!(click_at(&app, 100, 30, keep, row), Some(Click::Answer(false)));
+}
+
+/// A path arrives in the add prompt by being dropped, which is a mouse gesture:
+/// finishing the job should not have to be a keystroke.
+#[test]
+fn a_prompt_can_be_accepted_and_cancelled_with_the_mouse() {
+    let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+    app.prompt_add_with("C:/clips/dropped.mp4".into());
+
+    let (accept, row) = centre_of(&app, 100, 30, "ADD THESE");
+    assert_eq!(click_at(&app, 100, 30, accept, row), Some(Click::Submit));
+    let (cancel, row) = centre_of(&app, 100, 30, "cancel");
+    assert_eq!(click_at(&app, 100, 30, cancel, row), Some(Click::Cancel));
+
+    // With nothing typed there is nothing to accept, so the button is inert.
+    app.prompt_add();
+    let (accept, row) = centre_of(&app, 100, 30, "ADD THESE");
+    assert_eq!(click_at(&app, 100, 30, accept, row), None);
+}
+
+/// Clicking off a picker dismisses it, and clicking a bare part of it does not.
+#[test]
+fn a_picker_closes_when_clicked_off() {
+    let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
+    app.menu_quality();
+
+    assert_eq!(click_at(&app, 100, 30, 1, 1), Some(Click::Cancel), "the page behind it");
+
+    // The note at the top of the panel is part of the dialog, not off it.
+    let (column, row) = centre_of(&app, 100, 30, "Only matters for clips");
+    assert_eq!(click_at(&app, 100, 30, column, row), Some(Click::Ignore));
+
+    let (column, row) = centre_of(&app, 100, 30, "esc cancel");
+    assert_eq!(click_at(&app, 100, 30, column, row), Some(Click::Cancel));
 }
 
 #[test]
@@ -547,6 +721,18 @@ fn dump_screens() {
 {}", render(&app, 96, 26));
     app.close_overlay();
 
+    app.prompt_add_with("C:\\Users\\me\\Videos\\holiday\\clip 7.mp4".into());
+    println!("
+=== add prompt ===
+{}", render(&app, 96, 26));
+    app.close_overlay();
+
+    app.overlay = Overlay::Confirm(Confirm::Overwrite(PathBuf::from("C:/clips/merged.mp4")));
+    println!("
+=== overwrite dialog ===
+{}", render(&app, 96, 26));
+    app.close_overlay();
+
     app.toggle_help();
     println!("
 === key reference ===
@@ -589,4 +775,9 @@ fn dump_screens() {
     println!("
 === result ===
 {}", render(&app, 96, 26));
+
+    let (empty, _rx) = app_with(vec![]);
+    println!("
+=== nothing loaded yet ===
+{}", render(&empty, 96, 26));
 }

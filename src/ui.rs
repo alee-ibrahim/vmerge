@@ -9,18 +9,26 @@
 //!   rules. Nested borders spend rows and columns to say nothing.
 //! * **Every cell counts.** Numbers are right-aligned in columns sized to their
 //!   content, so they can be compared down the screen.
-//! * **One primary action.** `S START MERGE` is the only filled chip anywhere.
+//! * **One primary action.** Exactly one filled chip per screen: `S START MERGE`
+//!   with clips loaded, `A ADD CLIPS` when there are none.
+//! * **A button looks pressable, or it is not a button.** Anything clickable is
+//!   a chip - padded, capped at both ends, lit under the pointer, and clickable
+//!   across all of that. Anything that can only be typed stays plain text, and
+//!   anything with nothing to act on is greyed out rather than answering a click
+//!   with a complaint.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use crate::app::{App, Confirm, HelpSheet, Kind, Menu, Overlay, Prompt, Screen, SegState};
+use crate::app::{
+    App, Confirm, HelpSheet, Kind, Menu, Overlay, Prompt, PromptKind, Screen, SegState,
+};
 use crate::format;
 use crate::merge::{Outcome, Step};
-use crate::theme::{self, StatusTone, Theme, glyph};
+use crate::theme::{self, ChipKind, ChipStyle, StatusTone, Theme, glyph};
 
 /// What clicking somewhere on the screen means. Recorded during drawing,
 /// because drawing is the only place that knows where anything ended up.
@@ -34,6 +42,28 @@ pub enum Click {
     Remove,
     Back,
     Answer(bool),
+    /// Accept what has been typed into a prompt.
+    Submit,
+    /// Back out of an overlay, changing nothing.
+    Cancel,
+    /// Somewhere with nothing on it. Registered so that a dialog which closes
+    /// when clicked off does not also close when clicked on.
+    Ignore,
+}
+
+/// How one entry in a hint bar is drawn.
+#[derive(Clone, Copy, PartialEq)]
+enum Look {
+    /// A keyboard reminder. Plain text, because there is nothing to press here
+    /// with a mouse and pretending otherwise is worse than saying nothing.
+    Plain,
+    /// Nothing for it to act on yet. It keeps its words and its width, so the
+    /// bar does not rearrange itself as the list fills up, but it loses the
+    /// face that said it could be pressed.
+    Off,
+    Button,
+    Primary,
+    Danger,
 }
 
 /// One entry in a hint bar: the key, what it does, and whether it can be clicked.
@@ -41,19 +71,32 @@ struct Hint<'a> {
     key: &'a str,
     label: &'a str,
     click: Option<Click>,
-    primary: bool,
+    look: Look,
 }
 
 const fn hint<'a>(key: &'a str, label: &'a str, click: Option<Click>) -> Hint<'a> {
-    Hint { key, label, click, primary: false }
+    Hint { key, label, click, look: Look::Button }
 }
 
 const fn nav<'a>(key: &'a str, label: &'a str) -> Hint<'a> {
-    Hint { key, label, click: None, primary: false }
+    Hint { key, label, click: None, look: Look::Plain }
 }
 
 const fn primary<'a>(key: &'a str, label: &'a str, click: Click) -> Hint<'a> {
-    Hint { key, label, click: Some(click), primary: true }
+    Hint { key, label, click: Some(click), look: Look::Primary }
+}
+
+/// The answer a dialog cannot take back.
+const fn danger<'a>(key: &'a str, label: &'a str, click: Click) -> Hint<'a> {
+    Hint { key, label, click: Some(click), look: Look::Danger }
+}
+
+/// The same button, greyed out and inert, when there is nothing for it to do.
+///
+/// Better than letting it be pressed and answering with a complaint: the answer
+/// is on screen before the click rather than after it.
+fn only_if(enabled: bool, item: Hint) -> Hint {
+    if enabled { item } else { Hint { click: None, look: Look::Off, ..item } }
 }
 
 /// Scroll offsets and other view-only state, kept across frames so the list
@@ -66,6 +109,9 @@ pub struct UiState {
     /// Advances once per redraw, to animate the working indicator.
     frame: usize,
     hits: Vec<(Rect, Click)>,
+    /// Where the pointer is. Whatever sits under it is drawn a shade brighter,
+    /// which is the only way a terminal can say "this one" before the click.
+    pointer: Option<(u16, u16)>,
 }
 
 impl Default for UiState {
@@ -75,6 +121,7 @@ impl Default for UiState {
             offset: 0,
             frame: 0,
             hits: Vec::new(),
+            pointer: None,
         }
     }
 }
@@ -84,6 +131,16 @@ impl UiState {
         if area.width > 0 && area.height > 0 {
             self.hits.push((area, click));
         }
+    }
+
+    pub fn set_pointer(&mut self, column: u16, row: u16) {
+        self.pointer = Some((column, row));
+    }
+
+    /// Whether the pointer is over this region.
+    fn hovered(&self, area: Rect) -> bool {
+        self.pointer
+            .is_some_and(|(column, row)| area.contains(Position::new(column, row)))
     }
 
     /// What is under the pointer. Later regions win, which is what makes an
@@ -105,6 +162,11 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     let area = frame.area();
     ui.hits.clear();
     ui.frame = ui.frame.wrapping_add(1);
+    // With the mouse released no move events arrive, so the last known pointer
+    // would leave a button lit up under nothing.
+    if !app.mouse {
+        ui.pointer = None;
+    }
 
     // The page is painted rather than inherited, so the app looks the same
     // whatever the terminal's own background is.
@@ -161,12 +223,42 @@ fn fill(frame: &mut Frame, area: Rect, style: Style) {
     frame.render_widget(Block::default().style(style), area);
 }
 
-/// A row of key hints. Exactly one may be `primary`, which is drawn filled.
+/// How wide the chip for this key and label comes out. Must agree with
+/// `chip_spans`, or the click targets drift along the row: every chip after the
+/// first inherits the error of the ones before it.
+fn chip_width(key: &str, label: &str) -> u16 {
+    // cap, space, key, space, label, space, cap
+    (key.chars().count() + label.chars().count()) as u16 + 5
+}
+
+/// One button: padded, capped at both ends, and a single object to click.
 ///
-/// The widths here must match what the spans occupy or the click targets drift
-/// off their labels: key, space, label, then the gap.
-fn hint_bar(frame: &mut Frame, area: Rect, ui: &mut UiState, rows: &[&[Hint]]) {
-    const GAP: u16 = 3;
+/// The padding is the point. A key and some words with nothing around them read
+/// as a caption; the same text with a face behind it and air inside reads as
+/// something to press.
+fn chip_spans(key: &str, label: &str, style: ChipStyle) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(glyph::CAP_LEFT, style.edge),
+        Span::styled(format!(" {key}"), style.key),
+        Span::styled(format!(" {label} "), style.label),
+        Span::styled(glyph::CAP_RIGHT, style.edge),
+    ]
+}
+
+/// A row of buttons and keyboard reminders.
+///
+/// Anything clickable is drawn as a chip whose hit region covers the whole
+/// button, padding and caps included - the label is what a person aims at, but
+/// the edges are what they hit. Anything that can only be typed stays plain
+/// text, so the bar keeps saying which is which.
+///
+/// `ground` is the surface underneath, needed for the half-cell caps.
+fn hint_bar(frame: &mut Frame, area: Rect, ui: &mut UiState, ground: Color, rows: &[&[Hint]]) {
+    /// Between two chips. They carry their own padding, so this is the gap
+    /// between buttons rather than between words.
+    const CHIP_GAP: u16 = 2;
+    /// Between two plain hints, which have no face to separate them.
+    const TEXT_GAP: u16 = 3;
     let theme = ui.theme;
 
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
@@ -176,40 +268,54 @@ fn hint_bar(frame: &mut Frame, area: Rect, ui: &mut UiState, rows: &[&[Hint]]) {
         let y = area.y + row_index as u16;
 
         for item in row.iter() {
-            if item.primary {
-                // Drawn as a single filled run, so it reads as one button
-                // rather than as a key followed by some words.
-                let text = format!(" {} {} ", item.key, item.label);
-                let width = text.chars().count() as u16;
-                spans.push(Span::styled(text, theme.primary_chip()));
-                spans.push(Span::raw(" ".repeat(GAP as usize)));
-                if let Some(click) = item.click {
-                    ui.add_hit(Rect::new(x, y, clamp_width(width, x, area), 1), click);
+            // A button nobody can click would be a lie, so anything without a
+            // click behind it falls back to being a reminder.
+            let look = match item.look {
+                Look::Off => Look::Off,
+                other if item.click.is_some() => other,
+                _ => Look::Plain,
+            };
+            let kind = match look {
+                Look::Off => {
+                    // The chip's own shape, in spaces: same words, same width,
+                    // nothing to press.
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(format!(" {}", item.key), theme.label()));
+                    spans.push(Span::styled(format!(" {} ", item.label), theme.label()));
+                    spans.push(Span::raw(" ".repeat(CHIP_GAP as usize + 1)));
+                    x += chip_width(item.key, item.label) + CHIP_GAP;
+                    continue;
                 }
-                x += width + GAP;
-                continue;
-            }
-
-            // Something that cannot be clicked is drawn a shade back, so the
-            // bar separates "what you can press" from "how to get around".
-            let (key_style, label_style) = if item.click.is_some() {
-                (theme.key(), theme.dim())
-            } else {
-                (Style::default().fg(theme.faint).add_modifier(Modifier::BOLD), theme.label())
+                Look::Plain => {
+                    let width = (item.key.chars().count() + 1 + item.label.chars().count()) as u16;
+                    spans.push(Span::styled(
+                        item.key,
+                        Style::default().fg(theme.faint).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" {}{}", item.label, " ".repeat(TEXT_GAP as usize)),
+                        theme.label(),
+                    ));
+                    x += width + TEXT_GAP;
+                    continue;
+                }
+                Look::Button => ChipKind::Button,
+                Look::Primary => ChipKind::Primary,
+                Look::Danger => ChipKind::Danger,
             };
 
-            let key_width = item.key.chars().count() as u16;
-            let label_width = item.label.chars().count() as u16;
-            spans.push(Span::styled(item.key, key_style));
-            spans.push(Span::styled(
-                format!(" {}{}", item.label, " ".repeat(GAP as usize)),
-                label_style,
+            let width = chip_width(item.key, item.label);
+            let button = Rect::new(x, y, clamp_width(width, x, area), 1);
+            spans.extend(chip_spans(
+                item.key,
+                item.label,
+                theme.chip(kind, ground, ui.hovered(button)),
             ));
+            spans.push(Span::raw(" ".repeat(CHIP_GAP as usize)));
             if let Some(click) = item.click {
-                let width = key_width + 1 + label_width;
-                ui.add_hit(Rect::new(x, y, clamp_width(width, x, area), 1), click);
+                ui.add_hit(button, click);
             }
-            x += key_width + 1 + label_width + GAP;
+            x += width + CHIP_GAP;
         }
         lines.push(Line::from(spans));
     }
@@ -258,6 +364,9 @@ fn status_line(frame: &mut Frame, area: Rect, app: &App, ui: &UiState) {
 
 // --------------------------------------------------------------------- browse
 
+/// Rows the button bar takes on the list screen.
+const BUTTON_ROWS: u16 = 3;
+
 fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect) {
     let area = page(frame_area);
     let plan = app.plan_lines();
@@ -266,16 +375,19 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
     // forty-row window should not sit in a thirty-row empty panel. It still
     // takes everything available once there are enough clips to need it.
     let wanted = if app.clips.is_empty() { 9 } else { app.clips.len() as u16 + 1 };
-    let fixed = 1 + 1 + 1 + (1 + plan.len() as u16) + 2 + 1;
+    let fixed = 1 + 1 + 1 + (1 + plan.len() as u16) + 1 + BUTTON_ROWS + 1;
     let list_height = wanted.clamp(4, area.height.saturating_sub(fixed).max(4));
 
-    let [head, top_rule, list, mid_rule, info, hints, status, _] = Layout::vertical([
+    // A blank row above the buttons, because a toolbar pressed up against the
+    // text above it reads as one more line of that text.
+    let [head, top_rule, list, mid_rule, info, _, hints, status, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(list_height),
         Constraint::Length(1),
         Constraint::Length(1 + plan.len() as u16),
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(BUTTON_ROWS),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -308,28 +420,39 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
     draw_info(frame, info, app, ui, &plan);
 
     let mouse_label = if app.mouse { "mouse off" } else { "mouse on" };
+    let ground = ui.theme.base;
+    // With nothing loaded, the buttons that act on clips have nothing to act on,
+    // and the one action worth taking is the drop zone's own ADD CLIPS.
+    let any = !app.clips.is_empty();
     hint_bar(
         frame,
         hints,
         ui,
+        ground,
+        // Three rows rather than two: buttons take the room their padding needs,
+        // and a row that runs off a narrow terminal loses its last button
+        // entirely. Grouped by what they are for - the merge and how it comes
+        // out, then editing the list, then the program itself.
         &[
             &[
-                nav("↑↓", "move"),
-                nav("⇧↑↓", "reorder"),
-                hint("space", "mark", Some(Click::Mark)),
-                hint("del", "remove", Some(Click::Remove)),
-                hint("a", "add", Some(Click::Command('a'))),
-                hint("c", "clear", Some(Click::Command('c'))),
-            ],
-            &[
-                primary("S", "START MERGE", Click::Command('s')),
+                only_if(any, primary("S", "START MERGE", Click::Command('s'))),
                 hint("o", "output", Some(Click::Command('o'))),
                 hint("q", "quality", Some(Click::Command('q'))),
                 hint("t", "target", Some(Click::Command('t'))),
                 hint("e", "encoder", Some(Click::Command('e'))),
+            ],
+            &[
+                only_if(any, hint("space", "mark", Some(Click::Mark))),
+                only_if(any, hint("del", "remove", Some(Click::Remove))),
+                hint("a", "add", Some(Click::Command('a'))),
+                only_if(any, hint("c", "clear", Some(Click::Command('c')))),
+            ],
+            &[
                 hint("m", mouse_label, Some(Click::Command('m'))),
                 hint("?", "more", Some(Click::Command('?'))),
                 hint("x", "exit", Some(Click::Command('x'))),
+                nav("↑↓", "move"),
+                nav("⇧↑↓", "reorder"),
             ],
         ],
     );
@@ -338,23 +461,34 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
 }
 
 /// The empty state. A drop target rather than a paragraph in a box.
-fn draw_drop_zone(frame: &mut Frame, area: Rect, ui: &UiState) {
-    let theme = &ui.theme;
-    let inner = centred(area, 54, 7);
+fn draw_drop_zone(frame: &mut Frame, area: Rect, ui: &mut UiState) {
+    let theme = ui.theme;
+    let inner = centred(area, 54, 8);
     fill(frame, inner, Style::default().bg(theme.surface));
 
+    // Nothing else on this screen can be clicked yet, so the whole panel is the
+    // button and the chip inside it says so.
+    let hot = ui.hovered(inner);
+    ui.add_hit(inner, Click::Command('a'));
+
+    const KEY: &str = "A";
+    const LABEL: &str = "ADD CLIPS";
     let lines = vec![
         Line::raw(""),
         Line::styled("↓", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Line::raw(""),
         Line::styled("DROP YOUR CLIPS HERE", theme.strong()),
-        Line::raw(""),
         Line::styled("a folder works too, and so does a pasted path", theme.dim()),
-        Line::from(vec![
-            Span::styled("or press ", theme.label()),
-            Span::styled("A", theme.key()),
-            Span::styled(" to type one in", theme.label()),
-        ]),
+        Line::raw(""),
+        Line::from(chip_spans(
+            KEY,
+            LABEL,
+            // Filled: with an empty list this is the one action worth taking, so
+            // it is where the screen's single primary chip lives. The ground is
+            // the panel rather than the page, because that is what the caps are
+            // actually sitting on.
+            theme.chip(ChipKind::Primary, theme.surface, hot),
+        )),
     ];
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
@@ -436,6 +570,14 @@ fn draw_clip_list(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
         };
         let clip = &entry.clip;
         let selected = index == app.cursor;
+        let line_area = Rect::new(rows_area.x, rows_area.y + row as u16, rows_area.width, 1);
+
+        // Hover, painted under the row rather than into it: the spans below set a
+        // colour and leave the background alone, so it shows through them and the
+        // selected row's own wash still wins.
+        if !selected && ui.hovered(line_area) {
+            fill(frame, line_area, theme.hovered(theme.surface));
+        }
 
         let row_style = if selected { theme.selected() } else { Style::default().fg(theme.text) };
         let value_style = if selected { theme.selected() } else { theme.dim() };
@@ -479,7 +621,7 @@ fn draw_clip_list(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
             Span::styled(format!("{:>w$}", format::duration(clip.duration), w = columns.length as usize), value_style),
         ]));
 
-        ui.add_hit(Rect::new(rows_area.x, rows_area.y + row as u16, rows_area.width, 1), Click::Row(index));
+        ui.add_hit(line_area, Click::Row(index));
     }
     frame.render_widget(Paragraph::new(lines), rows_area);
 
@@ -653,7 +795,10 @@ fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState
         timing,
     );
 
-    hint_bar(frame, hints, ui, &[&[nav("esc", "stop the merge")]]);
+    // Stopping stays on the keyboard: a stray click must not be able to throw
+    // away work already done, so this is a reminder and not a button.
+    let ground = ui.theme.base;
+    hint_bar(frame, hints, ui, ground, &[&[nav("esc", "stop the merge")]]);
 }
 
 fn draw_segment_rows(frame: &mut Frame, area: Rect, view: &crate::app::MergeView, ui: &mut UiState) {
@@ -809,12 +954,15 @@ fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut 
     }
 
     let panel_height = (lines.len() as u16 + 2).min(area.height.saturating_sub(3));
-    let [head, top_rule, panel, _, hints] = Layout::vertical([
+    // The buttons follow the panel rather than sitting on the last row, so on a
+    // tall window they stay where the eye already is.
+    let [head, top_rule, panel, _, hints, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(panel_height),
-        Constraint::Min(0),
         Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
     ])
     .areas(area);
 
@@ -826,10 +974,12 @@ fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut 
         Rect { y: panel.y + 1, height: panel.height.saturating_sub(1), ..panel },
     );
 
+    let ground = theme.base;
     hint_bar(
         frame,
         hints,
         ui,
+        ground,
         &[&[
             primary("enter", "BACK TO THE LIST", Click::Back),
             hint("p", "show the file", Some(Click::Command('p'))),
@@ -887,8 +1037,15 @@ fn panel(frame: &mut Frame, area: Rect, ui: &UiState, title: &str, accent: ratat
 
 fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt, ui: &mut UiState) {
     let theme = ui.theme;
-    let box_area = centred(area, 76, 7);
+    let box_area = centred(area, 76, 9);
     let body = panel(frame, box_area, ui, &prompt.title, theme.accent);
+    let [text_area, _, buttons, _] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(body);
 
     // A dropped path is longer than the box, so the tail is what shows - the
     // end of a path is the part that identifies it.
@@ -911,7 +1068,26 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt, ui: &mut UiState)
         Line::raw(""),
         Line::from(vec![Span::raw("  "), Span::styled(prompt.hint.clone(), theme.label())]),
     ];
-    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(Paragraph::new(lines), text_area);
+
+    // Something to click. A path arrives here by being dropped, which is a
+    // mouse gesture, so finishing the job should not have to be a keystroke.
+    let verb = match prompt.kind {
+        PromptKind::AddPaths => "ADD THESE",
+        PromptKind::OutputName => "USE THIS NAME",
+        PromptKind::CustomTarget => "USE THIS SIZE",
+    };
+    let typed = !prompt.buffer.trim().is_empty();
+    hint_bar(
+        frame,
+        buttons,
+        ui,
+        theme.raised,
+        &[&[
+            only_if(typed, primary("enter", verb, Click::Submit)),
+            hint("esc", "cancel", Some(Click::Cancel)),
+        ]],
+    );
 }
 
 fn draw_menu(frame: &mut Frame, area: Rect, menu: &Menu, ui: &mut UiState) {
@@ -921,6 +1097,10 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &Menu, ui: &mut UiState) {
 
     let height = NOTE_ROWS + menu.items.len() as u16 + 6;
     let box_area = centred(area, WIDTH, height);
+    // A picker is dismissed by clicking off it, the way a menu anywhere else is.
+    // Both regions go down before the items, which therefore win over them.
+    ui.add_hit(area, Click::Cancel);
+    ui.add_hit(box_area, Click::Ignore);
     let body = panel(frame, box_area, ui, &menu.title, theme.accent);
 
     let [note_area, _, items_area, _, hint_area] = Layout::vertical([
@@ -940,36 +1120,55 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &Menu, ui: &mut UiState) {
     let mut lines = Vec::with_capacity(menu.items.len());
     for (i, (label, extra)) in menu.items.iter().enumerate() {
         let chosen = i == menu.cursor;
+        let row = Rect::new(items_area.x, items_area.y + i as u16, items_area.width, 1);
+        // Hover, not selection: the row lights up to say a click will land here,
+        // while the cursor bar still shows what enter would pick.
+        let hot = !chosen && ui.hovered(row);
         let (edge, edge_style) = if chosen {
             (glyph::CURSOR, Style::default().fg(theme.accent).bg(theme.accent_wash))
         } else {
-            (" ", Style::default())
+            (" ", if hot { theme.hovered(theme.raised) } else { Style::default() })
         };
-        let label_style = if chosen { theme.selected() } else { theme.body() };
+        let label_style = match (chosen, hot) {
+            (true, _) => theme.selected(),
+            (false, true) => theme.hovered(theme.raised),
+            (false, false) => theme.body(),
+        };
+        let index_style = match (chosen, hot) {
+            (true, _) => theme.selected(),
+            (false, true) => theme.hovered(theme.raised),
+            (false, false) => theme.label(),
+        };
+        let extra_style = if hot { theme.hovered(theme.raised) } else { theme.label() };
         let mut spans = vec![
-            Span::raw(" "),
+            Span::styled(" ", edge_style),
             Span::styled(edge, edge_style),
-            Span::styled(format!(" {} ", i + 1), if chosen { theme.selected() } else { theme.label() }),
+            Span::styled(format!(" {} ", i + 1), index_style),
             Span::styled(format!("{label} "), label_style),
         ];
         if !extra.is_empty() {
-            spans.push(Span::styled(format!(" {extra}"), theme.label()));
+            spans.push(Span::styled(format!(" {extra}"), extra_style));
         }
         lines.push(Line::from(spans));
 
-        ui.add_hit(
-            Rect::new(items_area.x, items_area.y + i as u16, items_area.width, 1),
-            Click::MenuItem(i),
-        );
+        ui.add_hit(row, Click::MenuItem(i));
     }
     frame.render_widget(Paragraph::new(lines), items_area);
 
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "click, or a number, or arrows and enter   ·   esc cancels",
+            "click a line, or press its number   ",
             theme.label(),
-        )),
-        indent(hint_area, 2),
+        ))
+        .alignment(Alignment::Right),
+        hint_area,
+    );
+    hint_bar(
+        frame,
+        hint_area,
+        ui,
+        theme.raised,
+        &[&[hint("esc", "cancel", Some(Click::Cancel))]],
     );
 }
 
@@ -979,7 +1178,10 @@ fn indent(area: Rect, by: u16) -> Rect {
 
 fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiState) {
     let theme = ui.theme;
-    let (title, body_lines, keys) = match confirm {
+    // One button per outcome, and no button for an outcome another one already
+    // covers: in the cancel dialog Esc and "keep going" are the same answer, so
+    // only the answer is drawn.
+    let (title, body_lines, buttons) = match confirm {
         Confirm::Overwrite(path) => (
             "That file already exists",
             vec![
@@ -993,7 +1195,13 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
                     Span::styled("Overwrite it, or write alongside it as merged_2.mp4?", theme.dim()),
                 ]),
             ],
-            [("y", "overwrite it"), ("n", "write alongside it")],
+            vec![
+                // The answer that cannot be undone is the filled one, because
+                // enter picks it: a default has to look like the default.
+                danger("y", "overwrite it", Click::Answer(true)),
+                hint("n", "write alongside it", Some(Click::Answer(false))),
+                hint("esc", "do not merge", Some(Click::Cancel)),
+            ],
         ),
         Confirm::CancelMerge => (
             "Stop the merge?",
@@ -1001,29 +1209,26 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
                 Span::raw("  "),
                 Span::styled("ffmpeg is stopped and the part-finished file is removed.", theme.dim()),
             ])],
-            [("y", "stop it"), ("n", "keep going")],
+            vec![
+                danger("y", "stop it", Click::Answer(true)),
+                hint("n", "keep going", Some(Click::Answer(false))),
+            ],
         ),
     };
 
-    let box_area = centred(area, 74, body_lines.len() as u16 + 6);
+    let box_area = centred(area, 74, body_lines.len() as u16 + 7);
     let body = panel(frame, box_area, ui, title, theme.warn);
 
-    let [text_area, buttons] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body);
+    // A blank row between the question and the answers. Without it the buttons
+    // read as another line of the question.
+    let [text_area, button_row, _] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+            .areas(body);
     let mut lines = vec![Line::raw("")];
     lines.extend(body_lines);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
 
-    hint_bar(
-        frame,
-        buttons,
-        ui,
-        &[&[
-            hint(keys[0].0, keys[0].1, Some(Click::Answer(true))),
-            hint(keys[1].0, keys[1].1, Some(Click::Answer(false))),
-            nav("esc", "cancel"),
-        ]],
-    );
+    hint_bar(frame, button_row, ui, theme.raised, &[&buttons]);
 }
 
 /// Everything the keyboard does, on demand. The hint bar carries the handful
@@ -1066,6 +1271,9 @@ fn draw_help(frame: &mut Frame, area: Rect, help: &HelpSheet, ui: &mut UiState) 
     let rows = left.len().max(right.len()) as u16;
 
     let box_area = centred(area, 100, rows + 5);
+    // A reference sheet goes away on any key, so it should go away on any click
+    // too - including a click on the sheet itself, which has nothing to press.
+    ui.add_hit(area, Click::Cancel);
     let body = panel(frame, box_area, ui, "Keys", theme.accent);
 
     let [columns_area, footer] =
@@ -1076,9 +1284,12 @@ fn draw_help(frame: &mut Frame, area: Rect, help: &HelpSheet, ui: &mut UiState) 
 
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
-    frame.render_widget(
-        Paragraph::new(Line::styled("esc or ? closes this", theme.label())),
-        indent(footer, 2),
+    hint_bar(
+        frame,
+        footer,
+        ui,
+        theme.raised,
+        &[&[hint("esc", "close", Some(Click::Cancel)), nav("?", "does the same")]],
     );
 }
 

@@ -33,7 +33,7 @@ const BURST_GAP: Duration = Duration::from_millis(15);
 ///
 /// Returns whether anything was handled, so an idle screen is not redrawn ten
 /// times a second for nothing.
-pub fn pump(app: &mut App, ui: &UiState, timeout: Duration) -> io::Result<bool> {
+pub fn pump(app: &mut App, ui: &mut UiState, timeout: Duration) -> io::Result<bool> {
     if !event::poll(timeout)? {
         return Ok(false);
     }
@@ -47,7 +47,7 @@ pub fn pump(app: &mut App, ui: &UiState, timeout: Duration) -> io::Result<bool> 
     Ok(true)
 }
 
-fn dispatch(app: &mut App, ui: &UiState, event: Event) -> io::Result<()> {
+fn dispatch(app: &mut App, ui: &mut UiState, event: Event) -> io::Result<()> {
     match event {
         Event::Paste(text) => {
             pasted(app, text);
@@ -66,7 +66,12 @@ fn dispatch(app: &mut App, ui: &UiState, event: Event) -> io::Result<()> {
 
 // ----------------------------------------------------------------------- mouse
 
-fn mouse_event(app: &mut App, ui: &UiState, mouse: MouseEvent) {
+fn mouse_event(app: &mut App, ui: &mut UiState, mouse: MouseEvent) {
+    // Every mouse event carries a position, and the next redraw lights up
+    // whatever is under it. Recorded before anything is acted on, so a button
+    // clicked without a preceding move still shows as the one that was hit.
+    ui.set_pointer(mouse.column, mouse.row);
+
     match mouse.kind {
         MouseEventKind::ScrollUp => scroll(app, -3),
         MouseEventKind::ScrollDown => scroll(app, 3),
@@ -99,6 +104,9 @@ fn clicked(app: &mut App, click: Click) {
         Click::Remove => app.remove_selection(),
         Click::Back => app.dismiss_result(),
         Click::Answer(yes) => answer(app, yes),
+        Click::Submit => app.submit_prompt(),
+        Click::Cancel => app.close_overlay(),
+        Click::Ignore => {}
         Click::Command(c) => match app.screen {
             Screen::Browse => command(app, c),
             Screen::Result(_) => result_command(app, c),
