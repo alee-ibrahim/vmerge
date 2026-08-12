@@ -1,12 +1,12 @@
 ===============================================================
- FRAMEJOIN  -  join video clips into one mp4
+ VMERGE  -  join video clips into one mp4
 ===============================================================
 
 HOW TO USE
 ----------
  1. Double-click MERGE-VIDEOS.exe
 
-    The FrameJoin screen opens, already listing any clips sitting
+    The vmerge screen opens, already listing any clips sitting
     in this folder.
 
  2. Drag your video files onto the window and press Enter.
@@ -30,7 +30,7 @@ Mixed formats in one go are fine. Output is always mp4
 
 FIRST RUN
 ---------
-FrameJoin needs ffmpeg. If it is not already on your PC, the first
+vmerge needs ffmpeg. If it is not already on your PC, the first
 run downloads it into a folder named "ffmpeg" here.
 
  - No administrator rights needed.

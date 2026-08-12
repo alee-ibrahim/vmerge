@@ -1,4 +1,4 @@
-vmerge/target/
+target/
 ffmpeg/
 
 # Local media and merge outputs

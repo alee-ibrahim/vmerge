@@ -1,4 +1,4 @@
-//! Video Merger - joins video clips into a single .mp4.
+//! vmerge - joins video clips into a single .mp4.
 //!
 //! Input  : mp4, mov, mkv, avi, m4v, webm, wmv, flv, mpg, mpeg, ts, m2ts, mts,
 //!          3gp, 3g2, ogv, asf
