@@ -616,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn unpacking_finds_the_binaries_and_reports_bytes() {
         let dir = scratch("unpack");
         let archive = dir.join("ffmpeg.zip");
@@ -663,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn an_archive_without_ffmpeg_is_rejected() {
         let dir = scratch("empty");
         let archive = dir.join("ffmpeg.zip");
@@ -684,6 +686,7 @@ mod tests {
     /// A downloaded archive is untrusted input: an entry named ..\..\evil.exe
     /// must not be able to write outside the staging folder.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn entries_cannot_escape_the_staging_folder() {
         let dir = scratch("slip");
         let archive = dir.join("ffmpeg.zip");
@@ -710,6 +713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn stale_leftovers_are_swept_but_other_files_are_left_alone() {
         let dir = scratch("sweep");
         let stale_zip = dir.join(format!("{TEMP_PREFIX}9999.zip"));

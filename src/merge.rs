@@ -717,6 +717,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn an_output_that_is_also_an_input_is_recognised() {
         let dir = std::env::temp_dir().join(format!("vmerge-same-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -744,6 +745,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn concat_list_escapes_quotes_and_slashes() {
         let dir = std::env::temp_dir().join(format!("vmerge-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

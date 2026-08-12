@@ -1,7 +1,7 @@
 [alias]
 lint = "clippy --all-targets --all-features -- -D warnings"
 
-# Miri needs isolation off, because the ffmpeg and merge tests write real files.
-# Worth knowing the incantation; see the note in .github/workflows/rust-checks.yml
-# for why it is not part of CI.
 miri-test = "miri test"
+
+[env]
+MIRIFLAGS = "-Zmiri-disable-isolation"

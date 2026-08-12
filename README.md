@@ -14,21 +14,20 @@ Developer checks:
 ```
 cargo test
 cargo lint
-cargo +nightly miri test
+cargo +nightly miri-test
 ```
 
 `cargo lint` is a repo alias for Clippy with warnings denied.
 
 Miri needs the nightly toolchain
-(`rustup toolchain install nightly --component miri`) and isolation turned off,
-because the ffmpeg and merge tests write real files:
+(`rustup toolchain install nightly --component miri`):
 
 ```
-set MIRIFLAGS=-Zmiri-disable-isolation
-cargo +nightly miri test
+cargo +nightly miri-test
 ```
 
-It is not part of CI, and is unlikely to earn its place: the crate has exactly
+The Miri alias disables isolation because the ffmpeg and merge tests write real
+files. Miri is not part of CI, and is unlikely to earn its place: the crate has exactly
 one `unsafe` block — the `SetFileAttributesW` call in `src/proc.rs` — and it is
 `#[cfg(windows)]`, so a Linux runner would have nothing to check. Miri cannot
 evaluate FFI calls either way.
