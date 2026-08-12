@@ -9,6 +9,30 @@ Build:
 cargo build --release
 ```
 
+Developer checks:
+
+```
+cargo test
+cargo lint
+cargo +nightly miri test
+```
+
+`cargo lint` is a repo alias for Clippy with warnings denied.
+
+Miri needs the nightly toolchain
+(`rustup toolchain install nightly --component miri`) and isolation turned off,
+because the ffmpeg and merge tests write real files:
+
+```
+set MIRIFLAGS=-Zmiri-disable-isolation
+cargo +nightly miri test
+```
+
+It is not part of CI, and is unlikely to earn its place: the crate has exactly
+one `unsafe` block — the `SetFileAttributesW` call in `src/proc.rs` — and it is
+`#[cfg(windows)]`, so a Linux runner would have nothing to check. Miri cannot
+evaluate FFI calls either way.
+
 The binary is `target/release/vmerge.exe`. Copy it to the project root as
 `MERGE-VIDEOS.exe` to get a friendly drag-and-drop target:
 

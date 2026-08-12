@@ -1,0 +1,53 @@
+name: Rust checks
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows is the platform this tool actually runs on. Every interesting path -
+  # hiding the temp folder, clearing the Zone.Identifier stream, CREATE_NO_WINDOW,
+  # the Explorer reveal, .exe discovery - is #[cfg(windows)] and compiles out
+  # anywhere else, so a green Linux-only run would say very little.
+  test:
+    name: Test and Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Not a test run: this only proves the non-Windows fallbacks still compile, so
+  # that reaching for a Windows API without a #[cfg] guard fails here rather than
+  # in someone's editor.
+  portability:
+    name: Compiles on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+# Miri is deliberately absent. There is exactly one unsafe block in the whole
+# crate - the SetFileAttributesW call in src/proc.rs - and it is #[cfg(windows)],
+# so on a Linux runner Miri would have nothing to check; it cannot evaluate FFI
+# calls in any case. It would also fail as written: the ffmpeg and merge tests
+# write real files, and Miri blocks filesystem access unless it is run with
+# -Zmiri-disable-isolation. If it is ever worth adding, it needs both that flag
+# and a reason to exist.
