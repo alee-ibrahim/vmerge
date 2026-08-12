@@ -1,0 +1,971 @@
+//! Application state and the actions the keyboard drives.
+//!
+//! Everything the UI draws is derived from this struct; ui.rs never decides
+//! anything. Long jobs (probing dropped files, merging) run on worker threads
+//! and report back through `AppEvent`, so the frame loop never blocks.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::time::Instant;
+
+use crate::collect::{self, AddEvent};
+use crate::encoder::{EncoderPref, Quality};
+use crate::ffmpeg::Tools;
+use crate::format;
+use crate::merge::{self, MergeEvent, Outcome, Step};
+use crate::plan::{self, TargetOverride};
+use crate::probe::ClipInfo;
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Add(AddEvent),
+    Merge(MergeEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Info,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// A clip plus whether the user has marked it for a bulk action.
+pub struct Entry {
+    pub clip: ClipInfo,
+    pub marked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// Paths typed, pasted or dropped in.
+    AddPaths,
+    OutputName,
+    CustomTarget,
+}
+
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub title: String,
+    pub hint: String,
+    pub buffer: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TargetChoice {
+    Auto,
+    Fixed(TargetOverride),
+    Custom,
+}
+
+pub enum MenuKind {
+    Quality,
+    Target(Vec<TargetChoice>),
+}
+
+pub struct Menu {
+    pub kind: MenuKind,
+    pub title: String,
+    pub note: String,
+    pub items: Vec<(String, String)>,
+    pub cursor: usize,
+}
+
+pub enum Confirm {
+    Overwrite(PathBuf),
+    CancelMerge,
+}
+
+/// One section of the key reference.
+pub struct HelpGroup {
+    pub title: &'static str,
+    pub keys: Vec<(&'static str, String)>,
+}
+
+/// Everything the keyboard does. The hint bar carries the handful that get used
+/// constantly; this carries the rest, on demand, so the bar can stay calm.
+pub struct HelpSheet {
+    pub groups: Vec<HelpGroup>,
+}
+
+impl HelpSheet {
+    fn new() -> Self {
+        let group = |title: &'static str, keys: Vec<(&'static str, &str)>| HelpGroup {
+            title,
+            keys: keys.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+        };
+        Self {
+            groups: vec![
+                group(
+                    "The list",
+                    vec![
+                        ("↑ ↓   j k", "move the cursor"),
+                        ("⇧↑ ⇧↓   J K", "move the selected clip"),
+                        ("home end   g G", "first, last"),
+                        ("space", "mark a clip"),
+                        ("del   d", "remove marked clips, or the selected one"),
+                        ("esc", "clear the marks"),
+                    ],
+                ),
+                group(
+                    "Clips",
+                    vec![
+                        ("a   f", "add files or a folder"),
+                        ("c", "clear the list"),
+                        ("n", "sort by filename"),
+                    ],
+                ),
+                group(
+                    "The merge",
+                    vec![
+                        ("s", "start"),
+                        ("o", "output name"),
+                        ("q", "quality"),
+                        ("t", "target size and framerate"),
+                        ("e", "encoder: the GPU when possible, or always the CPU"),
+                        ("r", "force every clip through the encoder"),
+                    ],
+                ),
+                group(
+                    "Other",
+                    vec![
+                        ("m", "release the mouse, so text can be selected"),
+                        ("x   ctrl+c", "exit"),
+                    ],
+                ),
+            ],
+        }
+    }
+}
+
+pub enum Overlay {
+    None,
+    Prompt(Prompt),
+    Menu(Menu),
+    Confirm(Confirm),
+    Help(HelpSheet),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegState {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+pub struct SegRow {
+    pub name: String,
+    pub duration: f64,
+    pub step: Step,
+    pub done: f64,
+    pub state: SegState,
+    pub elapsed: f64,
+}
+
+/// What the merge screen shows. Rebuilt each time a merge starts.
+pub struct MergeView {
+    pub output: PathBuf,
+    pub plan: Vec<String>,
+    pub rows: Vec<SegRow>,
+    pub active: Option<usize>,
+    pub joining: bool,
+    pub join_done: f64,
+    pub join_total: f64,
+    pub attempt: u32,
+    pub started: Instant,
+    pub total_duration: f64,
+}
+
+impl MergeView {
+    /// The prepare pass is the expensive part; the join is disk-bound and
+    /// quick, so it gets the last slice of the bar rather than half of it.
+    const JOIN_SHARE: f64 = 0.15;
+
+    pub(crate) fn new(output: PathBuf, clips: &[Entry]) -> Self {
+        Self {
+            output,
+            plan: Vec::new(),
+            rows: clips
+                .iter()
+                .map(|e| SegRow {
+                    name: e.clip.name.clone(),
+                    duration: e.clip.duration,
+                    step: Step::Copy,
+                    done: 0.0,
+                    state: SegState::Queued,
+                    elapsed: 0.0,
+                })
+                .collect(),
+            active: None,
+            joining: false,
+            join_done: 0.0,
+            join_total: 0.0,
+            attempt: 1,
+            started: Instant::now(),
+            total_duration: clips.iter().map(|e| e.clip.duration).sum(),
+        }
+    }
+
+    /// 0.0 to 1.0 across both phases.
+    pub fn overall(&self) -> f64 {
+        if self.total_duration <= 0.0 {
+            return if self.joining { 0.9 } else { 0.0 };
+        }
+        let prepared: f64 = self
+            .rows
+            .iter()
+            .map(|r| match r.state {
+                SegState::Done => r.duration,
+                SegState::Running => r.done.min(r.duration),
+                _ => 0.0,
+            })
+            .sum();
+        let prepare = (prepared / self.total_duration).clamp(0.0, 1.0) * (1.0 - Self::JOIN_SHARE);
+        let join = if self.join_total > 0.0 {
+            (self.join_done / self.join_total).clamp(0.0, 1.0) * Self::JOIN_SHARE
+        } else if self.joining {
+            Self::JOIN_SHARE * 0.5
+        } else {
+            0.0
+        };
+        (prepare + join).clamp(0.0, 1.0)
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// Seconds left, once there is enough progress for the estimate to mean
+    /// anything. Early guesses are wild, so below 2% it stays hidden.
+    pub fn remaining(&self) -> Option<f64> {
+        let fraction = self.overall();
+        if fraction < 0.02 {
+            return None;
+        }
+        let elapsed = self.elapsed();
+        if elapsed < 1.0 {
+            return None;
+        }
+        Some((elapsed / fraction - elapsed).max(0.0))
+    }
+}
+
+pub enum Screen {
+    Browse,
+    Merging(MergeView),
+    Result(Box<Outcome>),
+}
+
+pub struct App {
+    pub tools: Arc<Tools>,
+    pub root: PathBuf,
+    pub clips: Vec<Entry>,
+    pub cursor: usize,
+    pub output_name: String,
+    pub quality: Quality,
+    pub encoder: EncoderPref,
+    pub target_override: Option<TargetOverride>,
+    pub force_reencode: bool,
+    pub screen: Screen,
+    pub overlay: Overlay,
+    pub status: Option<(String, Kind)>,
+    /// Some(n) while a background probe is running: n files still to read.
+    pub probing: Option<(usize, usize)>,
+    pub cancel: Arc<AtomicBool>,
+    /// Whether mouse capture is on. Off hands text selection back to the terminal.
+    pub mouse: bool,
+    pub quit: bool,
+    tx: Sender<AppEvent>,
+}
+
+impl App {
+    pub fn new(tools: Arc<Tools>, root: PathBuf, tx: Sender<AppEvent>) -> Self {
+        Self {
+            tools,
+            root,
+            clips: Vec::new(),
+            cursor: 0,
+            output_name: "merged.mp4".into(),
+            quality: Quality::High,
+            encoder: EncoderPref::Auto,
+            target_override: None,
+            force_reencode: false,
+            screen: Screen::Browse,
+            overlay: Overlay::None,
+            status: None,
+            probing: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            mouse: true,
+            quit: false,
+            tx,
+        }
+    }
+
+    pub fn say(&mut self, text: impl Into<String>, kind: Kind) {
+        self.status = Some((text.into(), kind));
+    }
+
+    // ---------------------------------------------------------------- clips
+
+    pub fn add_paths(&mut self, candidates: Vec<String>) {
+        if candidates.is_empty() {
+            return;
+        }
+        if self.probing.is_some() {
+            self.say("Still reading the last batch - one moment.", Kind::Warn);
+            return;
+        }
+        self.probing = Some((0, 0));
+        collect::spawn_probe(self.tools.clone(), candidates, self.tx.clone(), AppEvent::Add);
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        if self.clips.is_empty() {
+            return;
+        }
+        let last = self.clips.len() - 1;
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, last as isize) as usize;
+    }
+
+    pub fn cursor_to(&mut self, index: usize) {
+        self.cursor = index.min(self.clips.len().saturating_sub(1));
+    }
+
+    /// Moves the clip under the cursor, and follows it. This is the action the
+    /// whole list exists for, so it gets the arrow keys rather than a prompt.
+    pub fn move_clip(&mut self, delta: isize) {
+        if self.clips.len() < 2 {
+            return;
+        }
+        let from = self.cursor;
+        let to = (from as isize + delta).clamp(0, self.clips.len() as isize - 1) as usize;
+        if from == to {
+            return;
+        }
+        let entry = self.clips.remove(from);
+        self.clips.insert(to, entry);
+        self.cursor = to;
+        self.say(format!("Moved to position {}.", to + 1), Kind::Good);
+    }
+
+    pub fn toggle_mark(&mut self) {
+        if let Some(entry) = self.clips.get_mut(self.cursor) {
+            entry.marked = !entry.marked;
+        }
+        self.move_cursor(1);
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.clips.iter().filter(|e| e.marked).count()
+    }
+
+    /// Removes every marked clip, or the one under the cursor when nothing is
+    /// marked - which is what a bare Del is expected to do.
+    pub fn remove_selection(&mut self) {
+        if self.clips.is_empty() {
+            return;
+        }
+        let marked = self.marked_count();
+        if marked == 0 {
+            let removed = self.clips.remove(self.cursor);
+            self.cursor_to(self.cursor);
+            self.say(format!("Removed {}.", removed.name_short()), Kind::Good);
+        } else {
+            self.clips.retain(|e| !e.marked);
+            self.cursor_to(self.cursor);
+            self.say(format!("Removed {marked} clips."), Kind::Good);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.clips.clear();
+        self.cursor = 0;
+        self.say("List cleared.", Kind::Good);
+    }
+
+    pub fn sort_by_name(&mut self) {
+        if self.clips.len() < 2 {
+            return;
+        }
+        let keep = self.clips.get(self.cursor).map(|e| e.clip.path.clone());
+        self.clips.sort_by_key(|e| format::natural_key(&e.clip.name));
+        if let Some(path) = keep
+            && let Some(index) = self.clips.iter().position(|e| e.clip.path == path)
+        {
+            self.cursor = index;
+        }
+        self.say("Sorted by filename (1, 2, 10 - not 1, 10, 2).", Kind::Good);
+    }
+
+    pub fn toggle_encoder(&mut self) {
+        self.encoder = self.encoder.toggled();
+        self.say(
+            format!("Encoder: {} ({})", self.encoder.label(), self.encoder.note()),
+            Kind::Good,
+        );
+    }
+
+    pub fn total_duration(&self) -> f64 {
+        self.clips.iter().map(|e| e.clip.duration).sum()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.clips.iter().map(|e| e.clip.size_bytes).sum()
+    }
+
+    fn clip_list(&self) -> Vec<ClipInfo> {
+        self.clips.iter().map(|e| e.clip.clone()).collect()
+    }
+
+    /// The one-line summary of what pressing S will actually do.
+    pub fn plan_lines(&self) -> Vec<String> {
+        if self.clips.is_empty() {
+            return Vec::new();
+        }
+        let clips = self.clip_list();
+        if self.clips.len() == 1 {
+            return vec!["One clip - it just gets copied into an mp4.".into()];
+        }
+        if !self.force_reencode && plan::can_stream_copy(&clips) {
+            return vec!["Fast join, nothing re-encoded - takes seconds.".into()];
+        }
+        let target = plan::target_format(&clips, self.target_override);
+        let convert = plan::convert_count(&clips, &target);
+        let source = if self.target_override.is_some() { "your choice" } else { "auto" };
+        vec![
+            format!("Convert to {} ({source}), then join.", target.label()),
+            format!(
+                "{convert} of {} clips need converting - press T to change the target.",
+                self.clips.len()
+            ),
+        ]
+    }
+
+    // -------------------------------------------------------------- overlays
+
+    pub fn prompt_add(&mut self) {
+        self.overlay = Overlay::Prompt(Prompt {
+            kind: PromptKind::AddPaths,
+            title: "Add clips".into(),
+            hint: "Drag files or a folder in, or paste a path. Enter to accept, Esc to cancel."
+                .into(),
+            buffer: String::new(),
+        });
+    }
+
+    /// Starts an add prompt already holding text - how a drop onto the list
+    /// screen is turned into an editable line the user can check before adding.
+    pub fn prompt_add_with(&mut self, text: String) {
+        self.prompt_add();
+        if let Overlay::Prompt(p) = &mut self.overlay {
+            p.buffer = text;
+        }
+    }
+
+    pub fn prompt_output(&mut self) {
+        self.overlay = Overlay::Prompt(Prompt {
+            kind: PromptKind::OutputName,
+            title: "Output file name".into(),
+            hint: "A name, or a full path. .mp4 is added if you leave the extension off.".into(),
+            buffer: self.output_name.clone(),
+        });
+    }
+
+    pub fn menu_quality(&mut self) {
+        let items = Quality::ALL
+            .iter()
+            .map(|q| (q.label().to_string(), q.note().to_string()))
+            .collect();
+        let cursor = Quality::ALL.iter().position(|q| *q == self.quality).unwrap_or(1);
+        self.overlay = Overlay::Menu(Menu {
+            kind: MenuKind::Quality,
+            title: "Quality".into(),
+            note: "Only matters for clips that get re-encoded.".into(),
+            items,
+            cursor,
+        });
+    }
+
+    pub fn menu_target(&mut self) {
+        if self.clips.is_empty() {
+            self.say("Add some clips first - the choices depend on what they are.", Kind::Warn);
+            return;
+        }
+        let clips = self.clip_list();
+        let auto = plan::target_format(&clips, None);
+        let biggest = clips
+            .iter()
+            .max_by_key(|c| c.width as u64 * c.height as u64)
+            .expect("clips is not empty");
+        let smallest = clips
+            .iter()
+            .min_by_key(|c| c.width as u64 * c.height as u64)
+            .expect("clips is not empty");
+
+        let describe = |c: &ClipInfo| format!("{}x{} @ {} fps", c.width, c.height, format::fps(c.fps));
+
+        let choices = vec![
+            TargetChoice::Auto,
+            TargetChoice::Fixed(TargetOverride {
+                width: biggest.width,
+                height: biggest.height,
+                fps: biggest.fps,
+            }),
+            TargetChoice::Fixed(TargetOverride {
+                width: smallest.width,
+                height: smallest.height,
+                fps: smallest.fps,
+            }),
+            TargetChoice::Fixed(TargetOverride { width: 1920, height: 1080, fps: 30.0 }),
+            TargetChoice::Fixed(TargetOverride { width: 1280, height: 720, fps: 30.0 }),
+            TargetChoice::Custom,
+        ];
+        let items = vec![
+            (format!("Auto - matches most of your footage: {}", auto.label()), String::new()),
+            (format!("Biggest clip: {}", describe(biggest)), String::new()),
+            (format!("Smallest clip - fastest: {}", describe(smallest)), String::new()),
+            ("1920x1080 @ 30 fps".to_string(), String::new()),
+            ("1280x720 @ 30 fps".to_string(), String::new()),
+            ("Type your own...".to_string(), "e.g. 1080x1920@25".into()),
+        ];
+
+        self.overlay = Overlay::Menu(Menu {
+            kind: MenuKind::Target(choices),
+            title: "Target size and framerate".into(),
+            note: "Everything is converted to one shape. Smaller and slower means a faster merge."
+                .into(),
+            items,
+            cursor: 0,
+        });
+    }
+
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    /// Opens the key reference, or closes it if it is already up.
+    pub fn toggle_help(&mut self) {
+        if matches!(self.overlay, Overlay::Help(_)) {
+            self.close_overlay();
+        } else {
+            self.overlay = Overlay::Help(HelpSheet::new());
+        }
+    }
+
+    pub fn submit_prompt(&mut self) {
+        let Overlay::Prompt(prompt) = &self.overlay else {
+            return;
+        };
+        let kind = prompt.kind;
+        let text = prompt.buffer.trim().to_string();
+        self.close_overlay();
+
+        if text.is_empty() {
+            return;
+        }
+
+        match kind {
+            PromptKind::AddPaths => {
+                let candidates = collect::split_path_line(&text);
+                if candidates.is_empty() {
+                    self.say("Nothing in that looked like a path.", Kind::Warn);
+                } else {
+                    self.add_paths(candidates);
+                }
+            }
+            PromptKind::OutputName => self.set_output_name(&text),
+            PromptKind::CustomTarget => self.set_custom_target(&text),
+        }
+    }
+
+    fn set_output_name(&mut self, raw: &str) {
+        let text = raw.trim().trim_matches('"');
+        let path = Path::new(text);
+
+        // Reject a name Windows cannot store here, rather than at the end of a
+        // long merge. A full path is allowed, so only its last part is checked.
+        let Some(leaf) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            self.say("That does not end in a file name.", Kind::Warn);
+            return;
+        };
+        const ILLEGAL: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+        if leaf.chars().any(|c| ILLEGAL.contains(&c) || (c as u32) < 32) {
+            self.say("A file name cannot contain any of  \\ / : * ? \" < > |", Kind::Warn);
+            return;
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && !parent.is_dir()
+        {
+            self.say(format!("There is no folder called {}", parent.display()), Kind::Warn);
+            return;
+        }
+
+        let mut name = text.to_string();
+        if Path::new(&name).extension().is_none() {
+            name.push_str(".mp4");
+        }
+        self.output_name = name.clone();
+        self.say(format!("Output name set to {name}"), Kind::Good);
+    }
+
+    fn set_custom_target(&mut self, text: &str) {
+        match parse_target_spec(text) {
+            Some((width, height, fps)) => {
+                let fps = fps.unwrap_or_else(|| {
+                    plan::target_format(&self.clip_list(), None).fps
+                });
+                self.target_override = Some(TargetOverride { width, height, fps });
+                self.announce_target();
+            }
+            None => self.say(
+                format!("Could not read '{text}'. Use something like 1920x1080@30."),
+                Kind::Warn,
+            ),
+        }
+    }
+
+    fn announce_target(&mut self) {
+        let target = plan::target_format(&self.clip_list(), self.target_override);
+        let suffix = if self.target_override.is_none() { " (auto)" } else { "" };
+        self.say(format!("Target set to {}{suffix}", target.label()), Kind::Good);
+    }
+
+    pub fn menu_move(&mut self, delta: isize) {
+        if let Overlay::Menu(menu) = &mut self.overlay {
+            let last = menu.items.len().saturating_sub(1) as isize;
+            menu.cursor = (menu.cursor as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    pub fn menu_pick(&mut self, index: Option<usize>) {
+        let Overlay::Menu(menu) = &self.overlay else {
+            return;
+        };
+        let index = index.unwrap_or(menu.cursor);
+        if index >= menu.items.len() {
+            return;
+        }
+
+        match &menu.kind {
+            MenuKind::Quality => {
+                let quality = Quality::ALL[index];
+                self.close_overlay();
+                self.quality = quality;
+                self.say(format!("Quality set to {}", quality.label()), Kind::Good);
+            }
+            MenuKind::Target(choices) => {
+                let choice = choices[index];
+                self.close_overlay();
+                match choice {
+                    TargetChoice::Auto => {
+                        self.target_override = None;
+                        self.announce_target();
+                    }
+                    TargetChoice::Fixed(over) => {
+                        self.target_override = Some(over);
+                        self.announce_target();
+                    }
+                    TargetChoice::Custom => {
+                        self.overlay = Overlay::Prompt(Prompt {
+                            kind: PromptKind::CustomTarget,
+                            title: "Size and framerate".into(),
+                            hint: "WxH@fps, e.g. 1080x1920@25. The @fps part is optional.".into(),
+                            buffer: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- merge
+
+    /// Where the merge will write, given the current output name.
+    pub fn resolved_output(&self) -> Option<PathBuf> {
+        let first = self.clips.first()?;
+        let folder = first.clip.path.parent().unwrap_or(&self.root).to_path_buf();
+        let mut name = self.output_name.clone();
+        if Path::new(&name).extension().is_none() {
+            name.push_str(".mp4");
+        }
+        let candidate = Path::new(&name);
+        Some(if candidate.is_absolute() { candidate.to_path_buf() } else { folder.join(name) })
+    }
+
+    pub fn request_merge(&mut self) {
+        if self.clips.is_empty() {
+            self.say("Nothing to merge yet - press A or drag some files in.", Kind::Warn);
+            return;
+        }
+        if self.probing.is_some() {
+            self.say("Still reading files - one moment.", Kind::Warn);
+            return;
+        }
+        let Some(output) = self.resolved_output() else {
+            return;
+        };
+        // Caught here as well as in the engine, so the answer arrives before a
+        // merge screen appears and fails.
+        if let Some(clash) = self.clips.iter().find(|e| merge::same_file(&e.clip.path, &output)) {
+            self.say(
+                format!("That output name is {} - one of the clips. Press O for another name.", clash.clip.name),
+                Kind::Bad,
+            );
+            return;
+        }
+        if output.exists() {
+            self.overlay = Overlay::Confirm(Confirm::Overwrite(output));
+            return;
+        }
+        self.launch_merge(output);
+    }
+
+    /// Declining an overwrite writes beside the existing file instead of
+    /// silently doing nothing.
+    pub fn merge_next_to(&mut self, existing: &Path) {
+        let folder = existing.parent().unwrap_or(&self.root).to_path_buf();
+        let output = collect::default_output_path(&folder);
+        if let Some(name) = output.file_name() {
+            self.output_name = name.to_string_lossy().into_owned();
+        }
+        self.launch_merge(output);
+    }
+
+    pub fn launch_merge(&mut self, output: PathBuf) {
+        self.close_overlay();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.screen = Screen::Merging(MergeView::new(output.clone(), &self.clips));
+
+        let job = merge::Job {
+            tools: self.tools.clone(),
+            clips: self.clip_list(),
+            output,
+            quality: self.quality,
+            encoder: self.encoder,
+            force_reencode: self.force_reencode,
+            target_override: self.target_override,
+        };
+        merge::spawn(job, self.cancel.clone(), self.tx.clone(), AppEvent::Merge);
+    }
+
+    pub fn request_cancel(&mut self) {
+        if matches!(self.screen, Screen::Merging(_)) {
+            self.overlay = Overlay::Confirm(Confirm::CancelMerge);
+        }
+    }
+
+    pub fn confirm_cancel(&mut self) {
+        self.close_overlay();
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Back to the list after a merge, with the output name advanced so a
+    /// second merge does not immediately ask about overwriting the first.
+    pub fn dismiss_result(&mut self) {
+        if let Screen::Result(outcome) = &self.screen {
+            let ok = outcome.ok;
+            if ok {
+                let folder = outcome.output.parent().unwrap_or(&self.root).to_path_buf();
+                if let Some(name) = collect::default_output_path(&folder).file_name() {
+                    self.output_name = name.to_string_lossy().into_owned();
+                }
+            }
+        }
+        self.screen = Screen::Browse;
+    }
+
+    pub fn open_output_folder(&self) {
+        let Screen::Result(outcome) = &self.screen else {
+            return;
+        };
+        reveal(&outcome.output);
+    }
+
+    // ---------------------------------------------------------------- events
+
+    pub fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Add(add) => self.handle_add(add),
+            AppEvent::Merge(merge) => self.handle_merge(merge),
+        }
+    }
+
+    fn handle_add(&mut self, event: AddEvent) {
+        match event {
+            AddEvent::Started(total) => self.probing = Some((0, total)),
+            AddEvent::Added(info) => {
+                self.clips.push(Entry { clip: *info, marked: false });
+                if let Some((done, total)) = &mut self.probing {
+                    *done += 1;
+                    self.status = Some((
+                        format!("Reading clips... {done}/{total}"),
+                        Kind::Info,
+                    ));
+                }
+            }
+            AddEvent::Rejected { name, why } => {
+                self.say(format!("Skipped {name}: {why}"), Kind::Warn);
+            }
+            AddEvent::Finished { added, rejected } => {
+                self.probing = None;
+                let message = match (added, rejected) {
+                    (0, 0) => "Nothing to add.".to_string(),
+                    (0, r) => format!("Nothing added - {r} item(s) could not be used."),
+                    (a, 0) => format!("Added {a} clip(s)."),
+                    (a, r) => format!("Added {a} clip(s). {r} skipped."),
+                };
+                let kind = match (added, rejected) {
+                    (0, _) => Kind::Bad,
+                    (_, 0) => Kind::Good,
+                    _ => Kind::Warn,
+                };
+                self.say(message, kind);
+                self.cursor_to(self.cursor);
+            }
+        }
+    }
+
+    fn handle_merge(&mut self, event: MergeEvent) {
+        // A finished merge switches screens; everything else updates the view.
+        if let MergeEvent::Finished(outcome) = event {
+            let kind = if outcome.ok { Kind::Good } else { Kind::Bad };
+            let message = if outcome.cancelled {
+                "Merge cancelled.".to_string()
+            } else if outcome.ok {
+                "Merge finished.".to_string()
+            } else {
+                "That merge failed.".to_string()
+            };
+            self.say(message, kind);
+            self.screen = Screen::Result(outcome);
+            self.close_overlay();
+            return;
+        }
+
+        let Screen::Merging(view) = &mut self.screen else {
+            return;
+        };
+
+        match event {
+            MergeEvent::Plan(line) => view.plan.push(line),
+            MergeEvent::Pass { total, attempt } => {
+                view.attempt = attempt;
+                if attempt > 1 {
+                    // A fallback pass starts the rows over. Without this the
+                    // retry inherits the finished state of the pass that just
+                    // failed, so it opens at nearly 100%.
+                    for row in view.rows.iter_mut() {
+                        row.state = SegState::Queued;
+                        row.done = 0.0;
+                        row.elapsed = 0.0;
+                    }
+                    view.joining = false;
+                    view.join_done = 0.0;
+                    view.join_total = 0.0;
+                }
+                debug_assert_eq!(total, view.rows.len(), "a pass covers every clip");
+            }
+            MergeEvent::SegmentStart { index, name, step, duration } => {
+                if let Some(row) = view.rows.get_mut(index) {
+                    row.name = name;
+                    row.step = step;
+                    row.duration = duration;
+                    row.done = 0.0;
+                    row.state = SegState::Running;
+                }
+                view.active = Some(index);
+            }
+            MergeEvent::SegmentProgress { index, done } => {
+                if let Some(row) = view.rows.get_mut(index) {
+                    row.done = done;
+                }
+            }
+            MergeEvent::SegmentEnd { index, step, ok, elapsed } => {
+                if let Some(row) = view.rows.get_mut(index) {
+                    row.step = step;
+                    row.state = if ok { SegState::Done } else { SegState::Failed };
+                    row.elapsed = elapsed;
+                    row.done = row.duration;
+                }
+                view.active = None;
+            }
+            MergeEvent::JoinStart => {
+                view.joining = true;
+                view.active = None;
+            }
+            MergeEvent::JoinProgress { done, total } => {
+                view.join_done = done;
+                view.join_total = total;
+            }
+            MergeEvent::Warning(text) => view.plan.push(text),
+            MergeEvent::Finished(_) => unreachable!("handled above"),
+        }
+    }
+}
+
+impl Entry {
+    fn name_short(&self) -> String {
+        format::ellipsize(&self.clip.name, 40)
+    }
+}
+
+/// "1080x1920@25" -> (1080, 1920, Some(25.0)). The @fps part is optional.
+pub fn parse_target_spec(text: &str) -> Option<(u32, u32, Option<f64>)> {
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let (size, fps) = match cleaned.split_once('@') {
+        Some((s, f)) => {
+            let parsed: f64 = f.parse().ok()?;
+            if !(1.0..=240.0).contains(&parsed) {
+                return None;
+            }
+            (s.to_string(), Some(parsed))
+        }
+        None => (cleaned, None),
+    };
+    let separator = size.chars().find(|c| matches!(c, 'x' | 'X' | '*'))?;
+    let (w, h) = size.split_once(separator)?;
+    let width: u32 = w.parse().ok()?;
+    let height: u32 = h.parse().ok()?;
+    if !(16..=16384).contains(&width) || !(16..=16384).contains(&height) {
+        return None;
+    }
+    Some((width, height, fps))
+}
+
+/// Shows the finished file in Explorer.
+fn reveal(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer wants /select,"path" as one argument and mangles anything
+        // else, so the quoting is written out by hand rather than escaped.
+        let mut command = std::process::Command::new("explorer.exe");
+        command.raw_arg(format!("/select,\"{}\"", path.display()));
+        let _ = command.spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(folder) = path.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_specs() {
+        assert_eq!(parse_target_spec("1920x1080@30"), Some((1920, 1080, Some(30.0))));
+        assert_eq!(parse_target_spec(" 1080 X 1920 "), Some((1080, 1920, None)));
+        assert_eq!(parse_target_spec("640*480@23.976"), Some((640, 480, Some(23.976))));
+        assert_eq!(parse_target_spec("1920"), None);
+        assert_eq!(parse_target_spec("4x4"), None, "absurdly small is a typo");
+        assert_eq!(parse_target_spec("1920x1080@600"), None, "600 fps is a typo");
+    }
+}

@@ -1,0 +1,25 @@
+vmerge/target/
+ffmpeg/
+
+# Local media and merge outputs
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.m4v
+*.webm
+*.wmv
+*.flv
+*.mpg
+*.mpeg
+*.ts
+*.m2ts
+*.mts
+*.3gp
+merged*.mp4
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+*.tmp
+*.log

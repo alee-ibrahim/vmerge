@@ -1,0 +1,268 @@
+//! The non-interactive path: no screen, just plain lines and an exit code.
+//! Ported from Start-OneShot.
+
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use anyhow::{Result, bail};
+
+use crate::collect;
+use crate::encoder::{EncoderPref, Quality};
+use crate::ffmpeg::Tools;
+use crate::format;
+use crate::merge::{self, MergeEvent};
+use crate::probe::{self, ClipInfo};
+
+pub struct Options {
+    pub files: Vec<PathBuf>,
+    pub folder: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+    pub quality: Quality,
+    pub encoder: EncoderPref,
+    pub force_reencode: bool,
+}
+
+/// Returns false when the merge did not produce a usable file, which the
+/// caller turns into a non-zero exit code.
+pub fn run(tools: Arc<Tools>, root: &Path, options: Options) -> Result<bool> {
+    let (selected, source_folder) = choose_inputs(root, &options)?;
+
+    if selected.is_empty() {
+        println!();
+        println!("  No video clips found.");
+        println!();
+        println!("  Folder checked: {}", source_folder.display());
+        println!("  Formats read:   {}", collect::VIDEO_EXTENSIONS.join(" "));
+        println!();
+        println!("  Copy your clips into that folder, then run this again.");
+        return Ok(false);
+    }
+
+    let output = match &options.output {
+        Some(given) => {
+            let mut path =
+                if given.is_absolute() { given.clone() } else { source_folder.join(given) };
+            if path.extension().is_none() {
+                path.set_extension("mp4");
+            }
+            path
+        }
+        None => collect::default_output_path(&source_folder),
+    };
+
+    println!();
+    println!("  Found {} clip(s) in: {}", selected.len(), source_folder.display());
+    println!();
+
+    let mut clips: Vec<ClipInfo> = Vec::new();
+    for (i, path) in selected.iter().enumerate() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        print!("  {:>3}. {}", i + 1, format::pad(&name, 40));
+        let _ = std::io::stdout().flush();
+        match probe::clip_info(&tools.ffprobe, path) {
+            Some(info) => {
+                println!(
+                    "  {:>9}  {:>5} fps  {:<6} {:<6} {}",
+                    info.dimensions(),
+                    format::fps(info.fps),
+                    info.video_codec,
+                    info.audio_label(),
+                    format::duration(info.duration)
+                );
+                clips.push(info);
+            }
+            None => println!("  [SKIPPED - not a readable video]"),
+        }
+    }
+
+    if clips.is_empty() {
+        bail!("None of the files could be read as video.");
+    }
+
+    let total_duration: f64 = clips.iter().map(|c| c.duration).sum();
+    let total_size: u64 = clips.iter().map(|c| c.size_bytes).sum();
+    println!();
+    println!(
+        "  Total input : {} clips, {}, {}",
+        clips.len(),
+        format::duration(total_duration),
+        format::size(total_size)
+    );
+    println!("  Output file : {}", output.display());
+    println!();
+
+    let job = merge::Job {
+        tools,
+        clips,
+        output,
+        quality: options.quality,
+        encoder: options.encoder,
+        force_reencode: options.force_reencode,
+        target_override: None,
+    };
+
+    let cancel = AtomicBool::new(false);
+    let total = job.clips.len();
+    let tty = std::io::stdout().is_terminal();
+    let mut current_duration = 0.0f64;
+    let mut current_label = String::new();
+    let mut last_percent = u32::MAX;
+
+    let outcome = merge::run(&job, &cancel, &mut |event| match event {
+        MergeEvent::Plan(line) => println!("  {line}"),
+        MergeEvent::Pass { attempt, .. } => {
+            if attempt > 1 {
+                println!();
+                println!("  Retrying (pass {attempt})...");
+            }
+        }
+        MergeEvent::SegmentStart { index, name, step, duration } => {
+            current_duration = duration;
+            last_percent = u32::MAX;
+            current_label =
+                format!("  [{}/{}] {:<8} {}", index + 1, total, step.verb(), format::pad(&name, 34));
+            redraw(&current_label, false, tty);
+        }
+        MergeEvent::SegmentProgress { done, .. } => {
+            if current_duration <= 0.0 {
+                return;
+            }
+            let percent = ((done / current_duration).clamp(0.0, 1.0) * 100.0) as u32;
+            if percent != last_percent {
+                last_percent = percent;
+                redraw(&format!("{current_label} {percent:>3}%"), false, tty);
+            }
+        }
+        MergeEvent::SegmentEnd { step, ok, elapsed, .. } => {
+            let mark = if ok {
+                format!("{} in {}", step.past(), format::short_duration(elapsed))
+            } else {
+                "FAILED".to_string()
+            };
+            redraw(&format!("{current_label} {mark}"), true, tty);
+        }
+        MergeEvent::JoinStart => {
+            println!();
+            // On a console this line is rewritten in place by the percentages
+            // that follow; in a log it has to stand on its own or the join
+            // leaves no trace at all.
+            redraw("  Joining...", !tty, tty);
+        }
+        MergeEvent::JoinProgress { done, total } => {
+            if total > 0.0 {
+                let percent = (done / total).clamp(0.0, 1.0) * 100.0;
+                redraw(&format!("  Joining... {percent:>3.0}%"), false, tty);
+            }
+        }
+        MergeEvent::Warning(text) => redraw(&format!("  {text}"), true, tty),
+        MergeEvent::Finished(_) => {}
+    });
+
+    println!();
+    println!();
+    if outcome.ok {
+        println!("  -------------------------------------------");
+        println!("  DONE");
+        println!("  -------------------------------------------");
+        println!("  File     : {}", outcome.output.display());
+        println!("  Size     : {}", format::size(outcome.size));
+        println!("  Length   : {}", format::duration(outcome.out_duration));
+        if let Some((w, h, fps)) = outcome.out_format {
+            println!("  Video    : {w}x{h} @ {} fps", format::fps(fps));
+        }
+        println!("  Took     : {}", format::duration(outcome.elapsed));
+    } else {
+        println!("  The merge did not finish. Nothing usable was written.");
+        if let Some(error) = &outcome.error {
+            println!("  Reason: {error}");
+        }
+    }
+    for warning in &outcome.warnings {
+        println!("  Note: {warning}");
+    }
+
+    Ok(outcome.ok)
+}
+
+/// Rewrites the current line in place. Padded to a fixed width, because a
+/// shorter line would otherwise leave the tail of the longer one it replaced.
+///
+/// With output redirected to a file there is no cursor to rewind, so only
+/// finished lines are printed - otherwise every percentage tick would land in
+/// the log as carriage-return litter.
+fn redraw(text: &str, finish: bool, tty: bool) {
+    if !tty {
+        if finish {
+            println!("{}", text.trim_end());
+        }
+        return;
+    }
+    print!("\r{text:<74}");
+    if finish {
+        println!();
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// Which files, in which order: an explicit list wins, then order.txt, then
+/// natural filename order.
+fn choose_inputs(root: &Path, options: &Options) -> Result<(Vec<PathBuf>, PathBuf)> {
+    if !options.files.is_empty() {
+        let mut selected = Vec::new();
+        for file in &options.files {
+            if file.is_file() {
+                selected.push(file.clone());
+            } else {
+                println!("  Not found, ignoring: {}", file.display());
+            }
+        }
+        let folder = selected
+            .first()
+            .and_then(|f| f.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        println!("  Using the files you listed, in the order you listed them.");
+        return Ok((selected, folder));
+    }
+
+    let folder = options.folder.clone().unwrap_or_else(|| root.to_path_buf());
+    if !folder.is_dir() {
+        bail!("Folder not found: {}", folder.display());
+    }
+
+    let output_leaf = options
+        .output
+        .as_ref()
+        .and_then(|o| o.file_name())
+        .map(|n| n.to_string_lossy().into_owned());
+    let found = collect::video_files_in_folder(&folder, output_leaf.as_deref());
+
+    // order.txt (one filename per line) overrides filename ordering.
+    let order_file = folder.join("order.txt");
+    if order_file.is_file() {
+        println!("  order.txt found - using the order listed in it.");
+        let text = std::fs::read_to_string(&order_file).unwrap_or_default();
+        let mut selected = Vec::new();
+        for line in text.lines() {
+            let key = line.trim().trim_matches('"');
+            if key.is_empty() || key.starts_with('#') {
+                continue;
+            }
+            match found.iter().find(|f| {
+                f.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(key))
+            }) {
+                Some(hit) => selected.push(hit.clone()),
+                None => println!("  order.txt lists a file that is not here: {key}"),
+            }
+        }
+        if selected.is_empty() {
+            println!("  order.txt matched nothing; falling back to filename order.");
+        } else {
+            return Ok((selected, folder));
+        }
+    }
+
+    Ok((found, folder))
+}
