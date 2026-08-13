@@ -161,6 +161,61 @@ event, and on older consoles a run of characters arriving faster than anyone can
 type is treated as pasted text. Either way it lands in the add prompt, where you
 can check it before it is added.
 
+### Updating itself
+
+Every start checks whether a newer release exists, and installs it if one does.
+The people this is for double-click an exe someone sent them; they do not watch a
+repository, so a fix has to come to them. When there is nothing to install — the
+usual case — the check costs about 280 ms and says nothing at all.
+
+When there is:
+
+```
+  Version 0.1.2 is out — this is 0.1.1. Updating.
+  ████████████████████████  100%   4.1 MB / 4.1 MB   9.8 MB/s
+  Updated to 0.1.2. Starting it now.
+```
+
+The new version then runs with the arguments you gave, and its exit code is
+passed straight through, so a script cannot tell the difference.
+
+What makes that safe enough to do without asking:
+
+- **Only a release of this repository, over TLS.** The download URL the API hands
+  back has to belong to it, which is what keeps a look-alike host out.
+- **Forwards only.** The tag has to parse *and* be strictly greater than what is
+  running. A tag this build cannot read is refused rather than guessed at, so a
+  malformed or renamed release can never install an older binary over a newer one.
+- **Checked before it is swapped in**: the length GitHub declares for the asset,
+  a Windows executable header, and the SHA-256 when the release publishes one as
+  `MERGE-VIDEOS.exe.sha256`. Publishing that file is worth the half-second — it
+  is the only check here that would survive someone with write access to a
+  release but not to the tag. If it is published and does not match, or cannot be
+  read, the update stops.
+- **Failing changes nothing.** No network, a rate-limited API, a stalled host, a
+  folder that cannot be written: all of them leave the running exe exactly as it
+  was, and the merge you actually came to do goes ahead. An update that does not
+  happen is never the reason something else did not happen.
+
+Turn it off with `--no-update`, or by setting `VMERGE_NO_UPDATE` to anything.
+Debug builds never update — replacing the build you are testing with a released
+one would be the opposite of helpful.
+
+A running exe cannot be overwritten on Windows, but it *can* be renamed, which
+frees its name for the new file. So the old one is moved to
+`MERGE-VIDEOS.exe.previous`, hidden, and deleted at the next start — nothing can
+delete it while it is still the process doing the deleting. That cleanup happens
+even with `--no-update`.
+
+Where the bytes come from is not a detail. `github.com/…/releases/download/…`
+redirects to `objects.githubusercontent.com`, which on the connection this was
+measured on refuses every attempt in about 300 ms — five for five with curl, and
+the same from inside the program. It is the same unreliability that made this
+project mirror ffmpeg in its own tree rather than attach it to a release. The
+GitHub *API* asset route serves the identical bytes through
+`release-assets.githubusercontent.com` and worked first time, every time, so that
+is tried first and the browser URL is the fallback.
+
 ### Command line
 
 Everything works without the screen too. `--no-tui` merges straight away and
@@ -181,6 +236,7 @@ MERGE-VIDEOS.exe --no-tui a.mp4 b.mp4 --quality small --encoder cpu
 | `--encoder` | `auto` \| `cpu` \| `nvenc` \| `qsv` \| `amf` |
 | `--force-reencode` | re-encode even when clips already match |
 | `--skip-ffmpeg-download` | fail instead of downloading ffmpeg |
+| `--no-update` | do not look for a newer version on start |
 | `--no-tui`, `--no-pause` | plain output; do not wait for a keypress |
 
 An `order.txt` in the folder (one filename per line, `#` for comments) sets the
@@ -298,10 +354,19 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-56 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+65 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
 what blocks the fast path) are covered directly, and every screen and overlay is
 rendered into a `TestBackend` and read back — including at terminal sizes down
 to 1x1, which is what catches a layout that would panic on a resize.
+
+The self-updater is tested where the decisions are, not where the network is:
+which releases are acceptable, which download URLs belong to this repository,
+that `0.1.10` is newer than `0.1.9`, and that the sweep removes a previous image
+and a part-finished download while leaving everything else in the folder alone.
+The parts that cannot be unit-tested — swapping a running exe and handing over to
+it — were exercised for real by building a binary labelled `0.1.0`, letting it
+update itself from the live release, and checking that the arguments, the exit
+code and `--version` all came out right on the other side.
 
 The mouse tests are worth keeping honest: they find a label on the rendered
 screen and click the middle of it, so if the hit-region arithmetic ever drifts

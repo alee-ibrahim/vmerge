@@ -25,6 +25,7 @@ mod probe;
 mod proc;
 mod theme;
 mod ui;
+mod update;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ use ratatui::crossterm::event::{
 
 use crate::app::{App, Screen};
 use crate::encoder::{EncoderPref, Quality};
+use crate::ffmpeg::Reporter;
 
 /// How often the screen is redrawn when nothing is happening.
 const TICK: Duration = Duration::from_millis(100);
@@ -83,6 +85,10 @@ struct Args {
     #[arg(long)]
     skip_ffmpeg_download: bool,
 
+    /// Do not look for a newer version on start.
+    #[arg(long)]
+    no_update: bool,
+
     /// Merge straight away and print plain text, with no interactive screen.
     #[arg(long)]
     no_tui: bool,
@@ -122,6 +128,25 @@ fn main() -> std::process::ExitCode {
 fn real_main(args: Args) -> Result<bool> {
     banner();
 
+    let mut reporter = SetupReporter::new();
+
+    // Whatever happens next, an earlier update's leftovers go now: nothing else
+    // in the program will ever get round to them.
+    update::tidy();
+
+    // Updating comes first, before ffmpeg is even looked for. Nothing has been
+    // started that could be lost, and whatever work this run turns out to
+    // involve - including a first-time ffmpeg download - should be done by the
+    // newer build rather than by this one.
+    if update_wanted(&args) && let update::Outcome::Replaced(version) = update::run(&mut reporter) {
+        reporter.log(&format!("Updated to {version}. Starting it now."));
+        let code = update::relaunch()?;
+        // Nothing left for this process to do: the new version has run to
+        // completion, said whatever it had to say, and paused if it needed to.
+        let _ = io::stdout().flush();
+        std::process::exit(code);
+    }
+
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -149,7 +174,6 @@ fn real_main(args: Args) -> Result<bool> {
         }
     }
 
-    let mut reporter = SetupReporter::new();
     let tools = ffmpeg::resolve(&exe_dir, &search, !args.skip_ffmpeg_download, &mut reporter)
         .context("setting up ffmpeg")?;
     let tools = Arc::new(tools);
@@ -292,6 +316,15 @@ fn progress_line(received: u64, total: Option<u64>, rate: f64) -> String {
         // No declared length, so there is nothing to be a fraction of.
         None => format!("  {}   {}", format::size(received), format::rate(rate)),
     }
+}
+
+/// Whether to look for a new version at all.
+///
+/// A debug build is skipped outright: it lives in target\debug, it is not what a
+/// release contains, and replacing it with one would throw away the build the
+/// developer is actually testing.
+fn update_wanted(args: &Args) -> bool {
+    !cfg!(debug_assertions) && !args.no_update && std::env::var_os("VMERGE_NO_UPDATE").is_none()
 }
 
 fn banner() {

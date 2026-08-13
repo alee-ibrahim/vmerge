@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -156,7 +157,7 @@ fn local_app_data() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("video-merge"))
 }
 
-fn is_writable(dir: &Path) -> bool {
+pub fn is_writable(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
@@ -170,14 +171,52 @@ fn is_writable(dir: &Path) -> bool {
     }
 }
 
+/// How long a transfer may take before it is treated as a stall.
+///
+/// Generous on purpose: the biggest source here is 106 MB and the slowest
+/// measured link served it at 268 KB/s, which is close to seven minutes. The
+/// point is only that an unreachable host cannot hang the program for ever,
+/// which with no timeout at all it can.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The agent setup downloads use. The self-updater builds its own with tighter
+/// limits, because that one runs before the user has asked for anything.
+fn setup_agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_global(Some(TRANSFER_TIMEOUT))
+            .build(),
+    )
+}
+
 /// Streams a download straight to disk rather than buffering it in memory:
 /// the archive is over 100 MB and nothing needs it all at once.
-fn download(url: &str, dest: &Path, reporter: &mut dyn Reporter) -> Result<()> {
-    let response = ureq::get(url)
+pub fn download(
+    agent: &ureq::Agent,
+    url: &str,
+    dest: &Path,
+    reporter: &mut dyn Reporter,
+) -> Result<()> {
+    let response = agent
+        .get(url)
         .header("User-Agent", "video-merge-setup")
         .call()
         .with_context(|| format!("requesting {url}"))?;
+    stream_to_file(response, dest, reporter)
+}
 
+/// Writes a response body to disk, reporting progress as it goes.
+///
+/// Split out from `download` so that a caller which has to send its own headers
+/// gets the same progress bar and the same short-read check: the self-updater
+/// asks GitHub's API for an asset's *bytes*, which takes a specific Accept
+/// header, and without one the answer is the asset's metadata instead.
+pub fn stream_to_file(
+    response: ureq::http::Response<ureq::Body>,
+    dest: &Path,
+    reporter: &mut dyn Reporter,
+) -> Result<()> {
     // Not every mirror declares a length, and a redirect chain can lose it, so
     // the reporter has to cope with not knowing the total.
     let total = response
@@ -216,7 +255,7 @@ fn download(url: &str, dest: &Path, reporter: &mut dyn Reporter) -> Result<()> {
 }
 
 /// SHA-256 of a file, read in chunks so a 100 MB archive is not held in memory.
-fn sha256_of(path: &Path) -> Result<String> {
+pub fn sha256_of(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
 
     let mut file = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
@@ -468,12 +507,13 @@ fn install(root: &Path, reporter: &mut dyn Reporter) -> Result<PathBuf> {
     // and unpack are attempted together: a 7z that will not decode should fall
     // back to the zip rather than failing setup outright.
     let mut result = Err(anyhow::anyhow!("no download source worked"));
+    let agent = setup_agent();
     for source in SOURCES {
         let name = source.name;
         // No size in the message: the bar reports whatever the server declares.
         // The figure inherited from the PowerShell said 40 MB; the zip is 106.
         reporter.log(&format!("Downloading ffmpeg from {name} - this happens once"));
-        if let Err(e) = download(source.url, &zip_path, reporter) {
+        if let Err(e) = download(&agent, source.url, &zip_path, reporter) {
             reporter.log(&format!("Could not download from {name}: {e}"));
             continue;
         }
