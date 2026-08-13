@@ -7,6 +7,10 @@ MERGE-VIDEOS.exe
 *.exe
 !vendor/*.exe
 
+# Its checksum, published beside it on a release so the self-updater can check
+# what it downloaded. Regenerated with the binary, so it is not history either.
+*.exe.sha256
+
 # Local media and merge outputs
 *.mp4
 *.mov
