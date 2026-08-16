@@ -11,10 +11,16 @@
 //! Clips that already share identical codecs/size/framerate are joined without
 //! re-encoding (seconds, zero quality loss). Anything mixed is normalised to a
 //! common format first, then joined.
+//!
+//! Pressing U takes a link instead, and downloads that one video through yt-dlp:
+//! `--download <URL>` is the same job without the screen. It is a separate job
+//! rather than a way of adding clips - it fetches the file and stops, and yt-dlp
+//! is only installed the first time a link is actually given.
 
 mod app;
 mod collect;
 mod encoder;
+mod fetch;
 mod ffmpeg;
 mod format;
 mod input;
@@ -26,6 +32,7 @@ mod proc;
 mod theme;
 mod ui;
 mod update;
+mod ytdlp;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +49,7 @@ use ratatui::crossterm::event::{
 
 use crate::app::{App, Screen};
 use crate::encoder::{EncoderPref, Quality};
+use crate::fetch::FetchQuality;
 use crate::ffmpeg::Reporter;
 
 /// How often the screen is redrawn when nothing is happening.
@@ -81,9 +89,21 @@ struct Args {
     #[arg(long)]
     force_reencode: bool,
 
+    /// Download this video and stop. Nothing is merged.
+    #[arg(long, value_name = "URL")]
+    download: Option<String>,
+
+    /// How much of the video to take when downloading.
+    #[arg(long, value_enum, default_value = "1080p")]
+    download_quality: FetchQuality,
+
     /// Never download ffmpeg; fail instead if it is missing.
     #[arg(long)]
     skip_ffmpeg_download: bool,
+
+    /// Never download yt-dlp; fail instead if it is missing.
+    #[arg(long)]
+    skip_ytdlp_download: bool,
 
     /// Do not look for a newer version on start.
     #[arg(long)]
@@ -178,6 +198,23 @@ fn real_main(args: Args) -> Result<bool> {
         .context("setting up ffmpeg")?;
     let tools = Arc::new(tools);
 
+    // A link is a job of its own: it downloads and stops, and nothing about a
+    // clip list, an output name or an encoder applies to it. Checked before the
+    // interactive screen is considered, because there is nothing to steer.
+    if let Some(url) = args.download.clone() {
+        return oneshot::download(
+            tools,
+            oneshot::Download {
+                url,
+                folder: root,
+                quality: args.download_quality,
+                install_root: exe_dir,
+                search,
+                allow_download: !args.skip_ytdlp_download,
+            },
+        );
+    }
+
     // Explicit files win; a list file is the same thing from a launcher script.
     let mut files = args.files.clone();
     if let Some(list) = &args.file_list {
@@ -206,7 +243,7 @@ fn real_main(args: Args) -> Result<bool> {
         );
     }
 
-    run_tui(tools, root, files, &args)
+    run_tui(tools, root, exe_dir, search, files, &args)
 }
 
 /// Setup progress on the plain console, before the interactive screen exists.
@@ -348,6 +385,8 @@ fn read_file_list(path: &Path) -> Result<Vec<PathBuf>> {
 fn run_tui(
     tools: Arc<ffmpeg::Tools>,
     root: PathBuf,
+    exe_dir: PathBuf,
+    search: Vec<PathBuf>,
     files: Vec<PathBuf>,
     args: &Args,
 ) -> Result<bool> {
@@ -356,6 +395,12 @@ fn run_tui(
     app.quality = args.quality;
     app.encoder = args.encoder;
     app.force_reencode = args.force_reencode;
+    // yt-dlp is only fetched when a link is actually given, so where it would go
+    // is carried rather than resolved.
+    app.fetch_quality = args.download_quality;
+    app.tool_root = exe_dir;
+    app.tool_search = search;
+    app.allow_ytdlp_download = !args.skip_ytdlp_download;
     if let Some(output) = &args.output
         && let Some(name) = output.file_name()
     {
@@ -384,9 +429,9 @@ fn run_tui(
     let result = (|| -> Result<()> {
         let mut dirty = true;
         while !app.quit {
-            // A merge screen has a moving clock, so it redraws on every tick;
-            // an idle list only redraws when something actually changed.
-            if dirty || matches!(app.screen, Screen::Merging(_)) {
+            // A merge or download screen has a moving clock, so it redraws on
+            // every tick; an idle list only redraws when something changed.
+            if dirty || matches!(app.screen, Screen::Merging(_) | Screen::Fetching(_)) {
                 terminal.draw(|frame| ui::draw(frame, &app, &mut ui_state))?;
             }
             dirty = input::pump(&mut app, &mut ui_state, TICK)?;
@@ -405,7 +450,7 @@ fn run_tui(
 
     // Leave the last outcome on the plain console, so closing the window is not
     // the only record of what happened.
-    if let Screen::Result(outcome) = &app.screen {
+    if let Some(outcome) = app.outcome() {
         println!();
         if outcome.ok {
             println!("  Wrote {}", outcome.output.display());
@@ -416,7 +461,7 @@ fn run_tui(
                 format::duration(outcome.elapsed)
             );
         } else if let Some(error) = &outcome.error {
-            println!("  The last merge did not finish: {error}");
+            println!("  That did not finish: {error}");
         }
     }
     println!();

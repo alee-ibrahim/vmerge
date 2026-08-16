@@ -8,11 +8,34 @@
 //! would eat the keystrokes meant for the UI.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+pub const EXE_SUFFIX: &str = ".exe";
+#[cfg(not(windows))]
+pub const EXE_SUFFIX: &str = "";
+
+pub fn exe_name(stem: &str) -> String {
+    format!("{stem}{EXE_SUFFIX}")
+}
+
+/// Where an executable of this name sits on PATH, if anywhere.
+///
+/// Every tool this program shells out to is looked up the same way, so the
+/// `.exe` suffix and the PATH walk live here rather than once per tool.
+pub fn find_on_path(stem: &str) -> Option<PathBuf> {
+    let name = exe_name(stem);
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(&name);
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
 
 /// Detach the child from our console so it cannot draw on it.
 #[cfg(windows)]

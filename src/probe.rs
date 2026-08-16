@@ -185,6 +185,30 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
     })
 }
 
+/// Just the container's length, in seconds, or 0.0 if it cannot be read.
+///
+/// Separate from `clip_info` on purpose: that one answers "is this readable
+/// video", and everything which calls it depends on a file with no video stream
+/// coming back as None. An audio-only download is exactly that file, and still
+/// has a length worth putting on the finished screen.
+pub fn duration_of(ffprobe: &Path, path: &Path) -> f64 {
+    let mut cmd = Command::new(ffprobe);
+    cmd.args(["-v", "quiet", "-print_format", "json", "-show_format", "--"]).arg(path);
+    let Ok(out) = proc::run_captured(cmd) else {
+        return 0.0;
+    };
+    if !out.status.success() {
+        return 0.0;
+    }
+    serde_json::from_slice::<ProbeOutput>(&out.stdout)
+        .ok()
+        .and_then(|data| data.format)
+        .and_then(|f| f.duration)
+        .and_then(|d| d.trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

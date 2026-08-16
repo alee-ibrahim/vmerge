@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crate::collect::{self, AddEvent};
 use crate::encoder::{EncoderPref, Quality};
+use crate::fetch::{self, FetchEvent, FetchQuality, Stage};
 use crate::ffmpeg::Tools;
 use crate::format;
 use crate::merge::{self, MergeEvent, Outcome, Step};
@@ -22,6 +23,7 @@ use crate::probe::ClipInfo;
 pub enum AppEvent {
     Add(AddEvent),
     Merge(MergeEvent),
+    Fetch(FetchEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub enum PromptKind {
     AddPaths,
     OutputName,
     CustomTarget,
+    /// A link to download from.
+    FetchUrl,
 }
 
 pub struct Prompt {
@@ -63,6 +67,9 @@ pub enum TargetChoice {
 pub enum MenuKind {
     Quality,
     Target(Vec<TargetChoice>),
+    /// Which stream to take from a link. Unlike the other two this is not a
+    /// setting being changed - picking one starts the download.
+    Fetch,
 }
 
 pub struct Menu {
@@ -76,6 +83,7 @@ pub struct Menu {
 pub enum Confirm {
     Overwrite(PathBuf),
     CancelMerge,
+    CancelFetch,
 }
 
 /// One section of the key reference.
@@ -113,6 +121,7 @@ impl HelpSheet {
                     "Clips",
                     vec![
                         ("a   f", "add files or a folder"),
+                        ("u", "download from a link"),
                         ("c", "clear the list"),
                         ("n", "sort by filename"),
                     ],
@@ -253,10 +262,66 @@ impl MergeView {
     }
 }
 
+/// What the download screen shows. Rebuilt each time a download starts.
+pub struct FetchView {
+    pub url: String,
+    /// The video's own name, once the site has said what it is.
+    pub title: Option<String>,
+    pub stage: Stage,
+    /// Which stream is arriving. Best video and best audio are usually separate
+    /// files, so the byte count runs from zero more than once.
+    pub stream: u32,
+    pub done: u64,
+    pub total: Option<u64>,
+    pub rate: f64,
+    pub eta: Option<f64>,
+    pub notes: Vec<String>,
+    pub started: Instant,
+}
+
+impl FetchView {
+    pub(crate) fn new(url: String) -> Self {
+        Self {
+            url,
+            title: None,
+            stage: Stage::Setup,
+            stream: 0,
+            done: 0,
+            total: None,
+            rate: 0.0,
+            eta: None,
+            notes: Vec::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// 0.0 to 1.0 through the stream currently arriving, or None when the
+    /// server has not said how big it is - a bar drawn without a total is a
+    /// guess dressed up as a measurement.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total.filter(|t| *t > 0)?;
+        Some((self.done as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// What to call what is on screen, at whatever detail is known.
+    pub fn what(&self) -> String {
+        self.title.clone().unwrap_or_else(|| self.url.clone())
+    }
+}
+
 pub enum Screen {
     Browse,
     Merging(MergeView),
+    Fetching(FetchView),
     Result(Box<Outcome>),
+    /// The same report as `Result`, from a download rather than a merge. Kept
+    /// apart only so that returning to the list does not renumber the merge
+    /// output after a download that never touched it.
+    Fetched(Box<Outcome>),
 }
 
 pub struct App {
@@ -278,6 +343,17 @@ pub struct App {
     /// Whether mouse capture is on. Off hands text selection back to the terminal.
     pub mouse: bool,
     pub quit: bool,
+    /// Which stream the download picker opens on. Whatever was taken last time
+    /// is usually what is wanted again.
+    pub fetch_quality: FetchQuality,
+    /// Where yt-dlp is installed if it has to be fetched, and where an existing
+    /// copy is looked for. Set by main, because only main knows where the
+    /// executable actually lives.
+    pub tool_root: PathBuf,
+    pub tool_search: Vec<PathBuf>,
+    pub allow_ytdlp_download: bool,
+    /// The link waiting for a quality to be picked.
+    pending_url: Option<String>,
     tx: Sender<AppEvent>,
 }
 
@@ -285,7 +361,6 @@ impl App {
     pub fn new(tools: Arc<Tools>, root: PathBuf, tx: Sender<AppEvent>) -> Self {
         Self {
             tools,
-            root,
             clips: Vec::new(),
             cursor: 0,
             output_name: "merged.mp4".into(),
@@ -300,6 +375,12 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             mouse: true,
             quit: false,
+            fetch_quality: FetchQuality::P1080,
+            tool_root: root.clone(),
+            tool_search: vec![root.clone()],
+            allow_ytdlp_download: true,
+            pending_url: None,
+            root,
             tx,
         }
     }
@@ -475,6 +556,40 @@ impl App {
         });
     }
 
+    /// Asks for a link. Deliberately its own prompt rather than a URL smuggled
+    /// through the add prompt: what happens next is a download and then nothing,
+    /// which is not what "add clips" promises.
+    pub fn prompt_fetch(&mut self) {
+        if matches!(self.screen, Screen::Merging(_) | Screen::Fetching(_)) {
+            return;
+        }
+        self.overlay = Overlay::Prompt(Prompt {
+            kind: PromptKind::FetchUrl,
+            title: "Download a video".into(),
+            hint: "Paste a link. YouTube and most other video sites work.".into(),
+            buffer: String::new(),
+        });
+    }
+
+    /// The stream picker. Opening it is the second half of `prompt_fetch`, so
+    /// this is where the download actually starts from.
+    fn menu_fetch(&mut self) {
+        let items = FetchQuality::ALL
+            .iter()
+            .map(|q| (q.label().to_string(), q.note().to_string()))
+            .collect();
+        let cursor =
+            FetchQuality::ALL.iter().position(|q| *q == self.fetch_quality).unwrap_or(1);
+        self.overlay = Overlay::Menu(Menu {
+            kind: MenuKind::Fetch,
+            title: "How much of it".into(),
+            note: "Bigger takes longer to fetch. Anything but audio arrives as an mp4."
+                .into(),
+            items,
+            cursor,
+        });
+    }
+
     pub fn menu_quality(&mut self) {
         let items = Quality::ALL
             .iter()
@@ -552,6 +667,12 @@ impl App {
     }
 
     pub fn close_overlay(&mut self) {
+        // Backing out of the stream picker abandons the link with it. It was
+        // only ever held for the picker to finish the job, and a link left
+        // lying about would attach itself to the next thing picked.
+        if matches!(&self.overlay, Overlay::Menu(menu) if matches!(menu.kind, MenuKind::Fetch)) {
+            self.pending_url = None;
+        }
         self.overlay = Overlay::None;
     }
 
@@ -587,6 +708,17 @@ impl App {
             }
             PromptKind::OutputName => self.set_output_name(&text),
             PromptKind::CustomTarget => self.set_custom_target(&text),
+            PromptKind::FetchUrl => match fetch::normalise_url(&text) {
+                Some(url) => {
+                    self.pending_url = Some(url);
+                    self.menu_fetch();
+                }
+                None => self.say(
+                    "That does not look like a link. It wants something like \
+                     https://www.youtube.com/watch?v=...",
+                    Kind::Warn,
+                ),
+            },
         }
     }
 
@@ -664,6 +796,17 @@ impl App {
                 self.close_overlay();
                 self.quality = quality;
                 self.say(format!("Quality set to {}", quality.label()), Kind::Good);
+            }
+            MenuKind::Fetch => {
+                let quality = FetchQuality::ALL[index];
+                // Taken before the overlay closes: closing the picker is also
+                // how the link gets abandoned.
+                let url = self.pending_url.take();
+                self.close_overlay();
+                self.fetch_quality = quality;
+                if let Some(url) = url {
+                    self.launch_fetch(url, quality);
+                }
             }
             MenuKind::Target(choices) => {
                 let choice = choices[index];
@@ -760,9 +903,39 @@ impl App {
         merge::spawn(job, self.cancel.clone(), self.tx.clone(), AppEvent::Merge);
     }
 
+    // -------------------------------------------------------------- downloads
+
+    pub fn launch_fetch(&mut self, url: String, quality: FetchQuality) {
+        // Caught here rather than after a screen full of progress: a read-only
+        // folder cannot take the finished file however well the download goes.
+        if !fetch::folder_is_usable(&self.root) {
+            self.say(
+                format!("Nothing can be written to {} - pick another folder.", self.root.display()),
+                Kind::Bad,
+            );
+            return;
+        }
+        self.close_overlay();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.screen = Screen::Fetching(FetchView::new(url.clone()));
+
+        let job = fetch::Job {
+            tools: self.tools.clone(),
+            url,
+            folder: self.root.clone(),
+            quality,
+            install_root: self.tool_root.clone(),
+            search: self.tool_search.clone(),
+            allow_download: self.allow_ytdlp_download,
+        };
+        fetch::spawn(job, self.cancel.clone(), self.tx.clone(), AppEvent::Fetch);
+    }
+
     pub fn request_cancel(&mut self) {
-        if matches!(self.screen, Screen::Merging(_)) {
-            self.overlay = Overlay::Confirm(Confirm::CancelMerge);
+        match self.screen {
+            Screen::Merging(_) => self.overlay = Overlay::Confirm(Confirm::CancelMerge),
+            Screen::Fetching(_) => self.overlay = Overlay::Confirm(Confirm::CancelFetch),
+            _ => {}
         }
     }
 
@@ -771,26 +944,36 @@ impl App {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// The report on screen, whichever of the two produced it.
+    pub fn outcome(&self) -> Option<&Outcome> {
+        match &self.screen {
+            Screen::Result(outcome) | Screen::Fetched(outcome) => Some(outcome),
+            _ => None,
+        }
+    }
+
     /// Back to the list after a merge, with the output name advanced so a
     /// second merge does not immediately ask about overwriting the first.
+    ///
+    /// A finished *download* leaves the name alone: it wrote a file of its own
+    /// choosing and never went near merged.mp4, so renumbering would throw away
+    /// an output name the user had set for a merge they have not run yet.
     pub fn dismiss_result(&mut self) {
-        if let Screen::Result(outcome) = &self.screen {
-            let ok = outcome.ok;
-            if ok {
-                let folder = outcome.output.parent().unwrap_or(&self.root).to_path_buf();
-                if let Some(name) = collect::default_output_path(&folder).file_name() {
-                    self.output_name = name.to_string_lossy().into_owned();
-                }
+        if let Screen::Result(outcome) = &self.screen
+            && outcome.ok
+        {
+            let folder = outcome.output.parent().unwrap_or(&self.root).to_path_buf();
+            if let Some(name) = collect::default_output_path(&folder).file_name() {
+                self.output_name = name.to_string_lossy().into_owned();
             }
         }
         self.screen = Screen::Browse;
     }
 
     pub fn open_output_folder(&self) {
-        let Screen::Result(outcome) = &self.screen else {
-            return;
-        };
-        reveal(&outcome.output);
+        if let Some(outcome) = self.outcome().filter(|o| o.ok) {
+            reveal(&outcome.output);
+        }
     }
 
     // ---------------------------------------------------------------- events
@@ -799,6 +982,57 @@ impl App {
         match event {
             AppEvent::Add(add) => self.handle_add(add),
             AppEvent::Merge(merge) => self.handle_merge(merge),
+            AppEvent::Fetch(fetch) => self.handle_fetch(fetch),
+        }
+    }
+
+    fn handle_fetch(&mut self, event: FetchEvent) {
+        // A finished download switches screens; everything else updates the view.
+        if let FetchEvent::Finished(outcome) = event {
+            let kind = if outcome.ok { Kind::Good } else { Kind::Bad };
+            let message = if outcome.cancelled {
+                "Download stopped.".to_string()
+            } else if outcome.ok {
+                match outcome.output.file_name() {
+                    Some(name) => format!("Downloaded {}", name.to_string_lossy()),
+                    None => "Download finished.".to_string(),
+                }
+            } else {
+                "That download failed.".to_string()
+            };
+            self.say(message, kind);
+            self.screen = Screen::Fetched(outcome);
+            self.close_overlay();
+            return;
+        }
+
+        let Screen::Fetching(view) = &mut self.screen else {
+            return;
+        };
+
+        match event {
+            FetchEvent::Note(line) => view.notes.push(line),
+            FetchEvent::Title(title) => view.title = Some(title),
+            FetchEvent::Stage(stage) => view.stage = stage,
+            FetchEvent::Stream(n) => {
+                view.stream = n;
+                // A stream starting *is* the download starting - derived here
+                // rather than relying on a Stage event arriving alongside, which
+                // would leave the screen saying "setting up" if it ever did not.
+                view.stage = Stage::Downloading;
+                // The count restarts with the stream, or the second one opens at
+                // whatever the first one finished on.
+                view.done = 0;
+                view.total = None;
+                view.eta = None;
+            }
+            FetchEvent::Progress { done, total, rate, eta } => {
+                view.done = done;
+                view.total = total;
+                view.rate = rate;
+                view.eta = eta;
+            }
+            FetchEvent::Finished(_) => unreachable!("handled above"),
         }
     }
 

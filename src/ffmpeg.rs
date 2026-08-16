@@ -102,24 +102,7 @@ const SOURCES: [Source; 4] = [
 /// files.
 const TEMP_PREFIX: &str = "video-merge-ffmpeg-";
 
-#[cfg(windows)]
-const EXE_SUFFIX: &str = ".exe";
-#[cfg(not(windows))]
-const EXE_SUFFIX: &str = "";
-
-fn exe_name(stem: &str) -> String {
-    format!("{stem}{EXE_SUFFIX}")
-}
-
-fn find_on_path(stem: &str) -> Option<PathBuf> {
-    let name = exe_name(stem);
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let candidate = dir.join(&name);
-            candidate.is_file().then_some(candidate)
-        })
-    })
-}
+use crate::proc::{EXE_SUFFIX, exe_name, find_on_path};
 
 /// The usual places a copy sits next to the tool. `roots` is searched in order,
 /// which is how a build in target/release still finds the ffmpeg folder that
@@ -153,7 +136,7 @@ fn find_local(roots: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-fn local_app_data() -> Option<PathBuf> {
+pub(crate) fn local_app_data() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("video-merge"))
 }
 
@@ -179,9 +162,10 @@ pub fn is_writable(dir: &Path) -> bool {
 /// which with no timeout at all it can.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// The agent setup downloads use. The self-updater builds its own with tighter
-/// limits, because that one runs before the user has asked for anything.
-fn setup_agent() -> ureq::Agent {
+/// The agent setup downloads use, ffmpeg's and yt-dlp's alike. The self-updater
+/// builds its own with tighter limits, because that one runs before the user has
+/// asked for anything.
+pub(crate) fn setup_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(30)))

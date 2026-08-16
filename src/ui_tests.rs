@@ -6,7 +6,8 @@
 //! stops appearing on screen.
 
 use super::*;
-use crate::app::{AppEvent, Entry, MergeView};
+use crate::app::{AppEvent, Entry, FetchView, MergeView};
+use crate::fetch::FetchEvent;
 use crate::ffmpeg::Tools;
 use crate::merge::{MergeEvent, Outcome};
 use crate::probe::ClipInfo;
@@ -137,6 +138,186 @@ fn every_overlay_renders() {
 
     app.overlay = Overlay::Confirm(Confirm::CancelMerge);
     assert!(render(&app, 100, 30).contains("STOP THE MERGE?"));
+
+    app.overlay = Overlay::Confirm(Confirm::CancelFetch);
+    assert!(render(&app, 100, 30).contains("STOP THE DOWNLOAD?"));
+
+    app.prompt_fetch();
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("DOWNLOAD A VIDEO"), "got:\n{screen}");
+    assert!(screen.contains("Paste a link"), "got:\n{screen}");
+}
+
+/// The picker is the second half of asking for a link, so a link that parses
+/// has to lead straight to it - and one that does not must say so instead.
+#[test]
+fn a_link_opens_the_stream_picker_and_a_path_does_not() {
+    let (mut app, _rx) = app_with(vec![]);
+
+    app.prompt_fetch();
+    if let Overlay::Prompt(prompt) = &mut app.overlay {
+        prompt.buffer = "youtu.be/dQw4w9WgXcQ".into();
+    }
+    app.submit_prompt();
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("HOW MUCH OF IT"), "got:\n{screen}");
+    for choice in ["best available", "1080p", "720p", "480p", "audio only"] {
+        assert!(screen.contains(choice), "{choice:?} has to be offered:\n{screen}");
+    }
+
+    // A dropped clip is not a link, and must not start a download.
+    app.close_overlay();
+    app.prompt_fetch();
+    if let Overlay::Prompt(prompt) = &mut app.overlay {
+        prompt.buffer = r"C:\Users\me\Videos\clip.mp4".into();
+    }
+    app.submit_prompt();
+    assert!(matches!(app.overlay, Overlay::None), "no picker for a path");
+    assert!(render(&app, 100, 30).contains("does not look like a link"));
+}
+
+/// Backing out of the picker has to drop the link with it, or it would attach
+/// itself to whatever the next picker was opened for.
+#[test]
+fn abandoning_the_picker_abandons_the_link() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.prompt_fetch();
+    if let Overlay::Prompt(prompt) = &mut app.overlay {
+        prompt.buffer = "https://example.com/v/1".into();
+    }
+    app.submit_prompt();
+    app.close_overlay();
+
+    // The quality picker is a setting, and picking from it must now change only
+    // that setting rather than starting a download nobody asked for.
+    app.menu_quality();
+    app.menu_pick(Some(0));
+    assert!(matches!(app.screen, Screen::Browse), "nothing should have started");
+}
+
+#[test]
+fn the_download_screen_reports_what_is_arriving() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/watch?v=abc".into()));
+
+    // Before the site answers there is only the link to show.
+    assert!(render(&app, 100, 30).contains("example.com"), "the link stands in for the title");
+
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Downloading)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stream(1)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Title("How to make bread".into())));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+        done: 5 * 1024 * 1024,
+        total: Some(20 * 1024 * 1024),
+        rate: 2.0 * 1024.0 * 1024.0,
+        eta: Some(8.0),
+    }));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("How to make bread"), "got:\n{screen}");
+    assert!(screen.contains("DOWNLOADING"), "got:\n{screen}");
+    assert!(screen.contains("25%"), "expected a bar:\n{screen}");
+    assert!(screen.contains('█'), "expected a filled bar:\n{screen}");
+    assert!(screen.contains("5.0 MB / 20.0 MB"), "got:\n{screen}");
+    assert!(screen.contains("2.0 MB/s"), "got:\n{screen}");
+    assert!(screen.contains("0:08"), "expected the estimate:\n{screen}");
+    assert!(screen.contains("stop the download"), "got:\n{screen}");
+}
+
+/// A bar needs something to be a fraction of. Some sites declare no length, and
+/// drawing one anyway would be a guess dressed up as a measurement.
+#[test]
+fn a_download_of_unknown_size_draws_no_bar() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/live".into()));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stream(1)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+        done: 3 * 1024 * 1024,
+        total: None,
+        rate: 512.0 * 1024.0,
+        eta: None,
+    }));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("no size given"), "got:\n{screen}");
+    assert!(!screen.contains('%'), "no percentage without a total:\n{screen}");
+    // The byte count is still the truth, and still moves.
+    assert!(screen.contains("3.0 MB"), "got:\n{screen}");
+    assert!(screen.contains("512 KB/s"), "got:\n{screen}");
+}
+
+/// Best video and best audio arrive as two files, so the bar runs 0..100 twice.
+/// That has to read as a second stream rather than as progress being lost.
+#[test]
+fn a_second_stream_restarts_the_bar_and_says_which_one_it_is() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/v".into()));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stream(1)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+        done: 100,
+        total: Some(100),
+        rate: 10.0,
+        eta: None,
+    }));
+    assert!(render(&app, 100, 30).contains("100%"));
+
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stream(2)));
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("STREAM 2"), "got:\n{screen}");
+    assert!(!screen.contains("100%"), "the second stream starts from nothing:\n{screen}");
+}
+
+/// Installing yt-dlp is an 18 MB transfer of its own, and the tail after the
+/// last byte is ffmpeg joining the streams. Both look like a hang unless the
+/// screen says which one it is.
+#[test]
+fn the_quiet_phases_of_a_download_still_say_what_they_are() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/v".into()));
+
+    app.handle_event(AppEvent::Fetch(FetchEvent::Note("Downloading yt-dlp 2026.07.04".into())));
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("SETTING UP"), "got:\n{screen}");
+    assert!(screen.contains("Downloading yt-dlp"), "got:\n{screen}");
+
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Finishing)));
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("PUTTING IT TOGETHER"), "got:\n{screen}");
+    assert!(screen.contains("finishing off"), "got:\n{screen}");
+}
+
+/// A download reports through the same screen a merge does, so a file that
+/// arrived from a link reads exactly like one that was built here.
+#[test]
+fn a_finished_download_reports_through_the_same_screen() {
+    let (mut app, _rx) = app_with(vec![]);
+    let mut done = outcome(true);
+    done.output = PathBuf::from("C:/clips/How to make bread.mp4");
+    app.screen = Screen::Fetched(Box::new(done));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("DONE"));
+    assert!(screen.contains("How to make bread.mp4"), "got:\n{screen}");
+    assert!(screen.contains("show the file"), "got:\n{screen}");
+}
+
+/// The merge output name belongs to the merge. A download wrote a file of its
+/// own choosing and never went near merged.mp4, so it must not renumber it.
+#[test]
+fn a_download_leaves_the_merge_output_name_alone() {
+    let (mut app, _rx) = app_with(vec![clip("a.mp4", 1920, 1080, 30.0, 5.0)]);
+    app.output_name = "holiday.mp4".into();
+
+    app.screen = Screen::Fetched(Box::new(outcome(true)));
+    app.dismiss_result();
+    assert_eq!(app.output_name, "holiday.mp4", "a download must not touch it");
+
+    // A finished merge still advances it, which is what stops the next merge
+    // asking about overwriting the last one.
+    app.screen = Screen::Result(Box::new(outcome(true)));
+    app.dismiss_result();
+    assert_ne!(app.output_name, "holiday.mp4", "a merge still renumbers");
 }
 
 #[test]
@@ -263,6 +444,21 @@ fn awkward_terminal_sizes_do_not_panic() {
 
         app.screen = Screen::Result(Box::new(outcome(true)));
         render(&app, w, h);
+
+        app.screen = Screen::Fetching(FetchView::new(
+            "https://example.com/a/very/long/link/that/overflows?v=abcdefghijklmnop".into(),
+        ));
+        render(&app, w, h);
+        app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+            done: 1024,
+            total: Some(4096),
+            rate: 512.0,
+            eta: Some(6.0),
+        }));
+        render(&app, w, h);
+
+        app.screen = Screen::Fetched(Box::new(outcome(true)));
+        render(&app, w, h);
         app.screen = Screen::Browse;
     }
 }
@@ -343,6 +539,7 @@ fn the_bottom_bar_buttons_match_their_labels() {
         ("mark", Click::Mark),
         ("remove", Click::Remove),
         ("add", Click::Command('a')),
+        ("download", Click::Command('u')),
         ("clear", Click::Command('c')),
     ] {
         let (column, row) = centre_of(&app, 100, 30, label);
@@ -458,6 +655,11 @@ fn buttons_with_nothing_to_act_on_cannot_be_pressed() {
     // Adding some is the exception, and the drop zone is a button for it too.
     let (column, row) = centre_of(&empty, 100, 30, "ADD CLIPS");
     assert_eq!(click_at(&empty, 100, 30, column, row), Some(Click::Command('a')));
+
+    // So is fetching one: a link needs no clips to work on, and with an empty
+    // list it is the second thing worth doing.
+    let (column, row) = centre_of(&empty, 100, 30, "download");
+    assert_eq!(click_at(&empty, 100, 30, column, row), Some(Click::Command('u')));
 
     // With clips loaded, the same buttons come back to life.
     let (loaded, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 5.0)]);
@@ -775,6 +977,45 @@ fn dump_screens() {
     println!("
 === result ===
 {}", render(&app, 96, 26));
+
+    app.screen = Screen::Browse;
+    app.prompt_fetch();
+    if let Overlay::Prompt(prompt) = &mut app.overlay {
+        prompt.buffer = "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into();
+    }
+    println!("
+=== link prompt ===
+{}", render(&app, 96, 26));
+    app.submit_prompt();
+    println!("
+=== stream picker ===
+{}", render(&app, 96, 26));
+    app.close_overlay();
+
+    app.screen =
+        Screen::Fetching(FetchView::new("https://www.youtube.com/watch?v=aqz-KE-bpKQ".into()));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Note(
+        "Downloading yt-dlp 2026.07.04 - this happens once".into(),
+    )));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stream(2)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Title(
+        "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film".into(),
+    )));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+        done: 17 * 1024 * 1024,
+        total: Some(29 * 1024 * 1024),
+        rate: 10.7 * 1024.0 * 1024.0,
+        eta: Some(1.0),
+    }));
+    println!("
+=== downloading ===
+{}", render(&app, 96, 26));
+
+    app.overlay = Overlay::Confirm(Confirm::CancelFetch);
+    println!("
+=== stop the download ===
+{}", render(&app, 96, 26));
+    app.close_overlay();
 
     let (empty, _rx) = app_with(vec![]);
     println!("

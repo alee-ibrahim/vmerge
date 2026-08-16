@@ -26,6 +26,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::app::{
     App, Confirm, HelpSheet, Kind, Menu, Overlay, Prompt, PromptKind, Screen, SegState,
 };
+use crate::fetch::Stage;
 use crate::format;
 use crate::merge::{Outcome, Step};
 use crate::theme::{self, ChipKind, ChipStyle, StatusTone, Theme, glyph};
@@ -175,7 +176,10 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     match &app.screen {
         Screen::Browse => draw_browse(frame, app, ui, area),
         Screen::Merging(_) => draw_merging(frame, area, app, ui),
-        Screen::Result(outcome) => draw_result(frame, area, outcome, ui),
+        Screen::Fetching(view) => draw_fetching(frame, area, view, ui),
+        Screen::Result(outcome) | Screen::Fetched(outcome) => {
+            draw_result(frame, area, outcome, ui)
+        }
     }
 
     if !matches!(app.overlay, Overlay::None) {
@@ -445,6 +449,9 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
                 only_if(any, hint("space", "mark", Some(Click::Mark))),
                 only_if(any, hint("del", "remove", Some(Click::Remove))),
                 hint("a", "add", Some(Click::Command('a'))),
+                // Never greyed out: a link needs no clips to work on, and with
+                // an empty list it is the second thing worth doing.
+                hint("u", "download", Some(Click::Command('u'))),
                 only_if(any, hint("c", "clear", Some(Click::Command('c')))),
             ],
             &[
@@ -893,6 +900,136 @@ fn draw_segment_rows(frame: &mut Frame, area: Rect, view: &crate::app::MergeView
     }
 }
 
+// ------------------------------------------------------------------ fetching
+
+/// The download screen.
+///
+/// Simpler than the merge screen because there is only ever one thing happening,
+/// but it has the same job: a wait of minutes with nothing moving on it is
+/// indistinguishable from a hang. Every phase says which one it is, including the
+/// two that are easy to forget - installing yt-dlp the first time, and the tail
+/// where ffmpeg joins the video and audio streams after the last byte lands.
+fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchView, ui: &mut UiState) {
+    let area = page(frame_area);
+    let theme = ui.theme;
+    let spinner = ui.spinner();
+
+    let note_rows = view.notes.len().min(3) as u16;
+    let [head, top_rule, what, _, notes_area, _, bar_label, bar_line, _, timing, _, hints] =
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(note_rows),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
+    header(frame, head, ui, view.stage.label());
+    rule(frame, top_rule, ui);
+
+    // The video's own name once the site has answered, and until then the link,
+    // so the screen is never showing something the user cannot recognise.
+    let room = (what.width as usize).saturating_sub(12);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(spinner, Style::default().fg(theme.accent)),
+            Span::raw("  "),
+            Span::styled(format::ellipsize(&view.what(), room), theme.strong()),
+        ])),
+        what,
+    );
+
+    if note_rows > 0 {
+        let lines: Vec<Line> = view
+            .notes
+            .iter()
+            .rev()
+            .take(note_rows as usize)
+            .rev()
+            .map(|l| Line::styled(format!("  {l}"), theme.dim()))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), notes_area);
+    }
+
+    // Video and audio usually arrive as two separate files, so the bar restarts
+    // part way through. Saying which one is running keeps that from reading as
+    // progress being lost.
+    let label = match (view.stage, view.stream) {
+        (Stage::Setup, _) => "SETTING UP".to_string(),
+        (Stage::Finishing, _) => "PUTTING IT TOGETHER".to_string(),
+        (_, 0 | 1) => "DOWNLOADING".to_string(),
+        (_, n) => format!("DOWNLOADING  STREAM {n}"),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw("  "), Span::styled(label, theme.label())])),
+        bar_label,
+    );
+
+    let width = bar_line.width.saturating_sub(4) as usize;
+    match view.fraction() {
+        Some(fraction) => {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("{:>3.0}%  ", fraction * 100.0),
+                    theme.strong(),
+                ))
+                .alignment(Alignment::Right),
+                bar_label,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(theme::bar(fraction, width), Style::default().fg(theme.accent)),
+                ])),
+                bar_line,
+            );
+        }
+        // Some sites declare no length, and a bar drawn without one would be a
+        // guess dressed up as a measurement. The byte count below is the truth.
+        None => {
+            frame.render_widget(
+                Paragraph::new(Line::styled("  no size given by the site", theme.label())),
+                bar_line,
+            );
+        }
+    }
+
+    let mut stats = vec![Span::raw("  "), Span::styled("got ", theme.label())];
+    match view.total {
+        Some(total) => stats.push(Span::styled(
+            format!("{} / {}", format::size(view.done), format::size(total)),
+            theme.dim(),
+        )),
+        None => stats.push(Span::styled(format::size(view.done), theme.dim())),
+    }
+    stats.extend([
+        Span::styled("   at ", theme.label()),
+        Span::styled(format::rate(view.rate), theme.dim()),
+        Span::styled("   elapsed ", theme.label()),
+        Span::styled(format::short_duration(view.elapsed()), theme.dim()),
+        Span::styled("   remaining ", theme.label()),
+        Span::styled(
+            view.eta.map(format::short_duration).unwrap_or_else(|| "estimating".into()),
+            theme.dim(),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(Line::from(stats)), timing);
+
+    // Stopping stays on the keyboard, the same as the merge screen: a stray
+    // click must not be able to throw away a download already half done.
+    let ground = ui.theme.base;
+    hint_bar(frame, hints, ui, ground, &[&[nav("esc", "stop the download")]]);
+}
+
 // --------------------------------------------------------------------- result
 
 fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut UiState) {
@@ -1076,6 +1213,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt, ui: &mut UiState)
         PromptKind::AddPaths => "ADD THESE",
         PromptKind::OutputName => "USE THIS NAME",
         PromptKind::CustomTarget => "USE THIS SIZE",
+        PromptKind::FetchUrl => "GET THIS ONE",
     };
     let typed = !prompt.buffer.trim().is_empty();
     hint_bar(
@@ -1208,6 +1346,20 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
             vec![Line::from(vec![
                 Span::raw("  "),
                 Span::styled("ffmpeg is stopped and the part-finished file is removed.", theme.dim()),
+            ])],
+            vec![
+                danger("y", "stop it", Click::Answer(true)),
+                hint("n", "keep going", Some(Click::Answer(false))),
+            ],
+        ),
+        Confirm::CancelFetch => (
+            "Stop the download?",
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Whatever has arrived so far is thrown away, so nothing half-finished is left.",
+                    theme.dim(),
+                ),
             ])],
             vec![
                 danger("y", "stop it", Click::Answer(true)),

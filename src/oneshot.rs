@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 
 use crate::collect;
 use crate::encoder::{EncoderPref, Quality};
+use crate::fetch::{self, FetchEvent, FetchQuality};
 use crate::ffmpeg::Tools;
 use crate::format;
 use crate::merge::{self, MergeEvent};
@@ -185,6 +186,124 @@ pub fn run(tools: Arc<Tools>, root: &Path, options: Options) -> Result<bool> {
     }
     for warning in &outcome.warnings {
         println!("  Note: {warning}");
+    }
+
+    Ok(outcome.ok)
+}
+
+pub struct Download {
+    pub url: String,
+    pub folder: PathBuf,
+    pub quality: FetchQuality,
+    pub install_root: PathBuf,
+    pub search: Vec<PathBuf>,
+    pub allow_download: bool,
+}
+
+/// `--download` : fetch one video and stop. No clip list, no merge, no screen.
+///
+/// Returns false when nothing usable was written, which the caller turns into a
+/// non-zero exit code - so this is usable from a script that has to know.
+pub fn download(tools: Arc<Tools>, options: Download) -> Result<bool> {
+    println!();
+    println!("  Link    : {}", options.url);
+    println!("  Quality : {}", options.quality.label());
+    println!("  Folder  : {}", options.folder.display());
+    println!();
+
+    let job = fetch::Job {
+        tools,
+        url: options.url,
+        folder: options.folder,
+        quality: options.quality,
+        install_root: options.install_root,
+        search: options.search,
+        allow_download: options.allow_download,
+    };
+
+    let cancel = AtomicBool::new(false);
+    let tty = std::io::stdout().is_terminal();
+    let mut stream = 0u32;
+    let mut last_percent = u32::MAX;
+    // Redirected output gets a line per stream rather than a bar it cannot draw,
+    // so a log ends up with a record instead of carriage-return litter.
+    let mut logged_percent = 0u32;
+
+    let outcome = fetch::run(&job, &cancel, &mut |event| match event {
+        FetchEvent::Note(line) => redraw(&format!("  {line}"), true, tty),
+        FetchEvent::Title(title) => redraw(&format!("  {title}"), true, tty),
+        // Not announced here, unlike on the interactive screen. A stream ending
+        // means either that ffmpeg is now joining or that a second stream is
+        // about to start, and the plain console cannot take a line back once it
+        // has printed it - so it says nothing rather than something it may have
+        // to contradict two lines later.
+        FetchEvent::Stage(_) => {}
+        FetchEvent::Stream(n) => {
+            stream = n;
+            last_percent = u32::MAX;
+            logged_percent = 0;
+        }
+        FetchEvent::Progress { done, total, rate, eta } => {
+            let where_ = if stream > 1 {
+                format!("  stream {stream}")
+            } else {
+                "  downloading".to_string()
+            };
+            let Some(total) = total.filter(|t| *t > 0) else {
+                // No declared length, so there is nothing to be a fraction of.
+                redraw(
+                    &format!("{where_} {} at {}", format::size(done), format::rate(rate)),
+                    false,
+                    tty,
+                );
+                return;
+            };
+            let percent = ((done as f64 / total as f64).clamp(0.0, 1.0) * 100.0) as u32;
+            if percent == last_percent {
+                return;
+            }
+            last_percent = percent;
+            let line = format!(
+                "{where_} {percent:>3}%   {} / {}   {}   {} left",
+                format::size(done),
+                format::size(total),
+                format::rate(rate),
+                eta.map(format::short_duration).unwrap_or_else(|| "--:--".into())
+            );
+            if tty {
+                redraw(&line, false, tty);
+            } else if percent >= logged_percent + 25 {
+                logged_percent = percent - percent % 25;
+                println!("{}", line.trim_end());
+            }
+        }
+        FetchEvent::Finished(_) => {}
+    });
+
+    if tty {
+        println!();
+    }
+    println!();
+    if outcome.ok {
+        println!("  -------------------------------------------");
+        println!("  DONE");
+        println!("  -------------------------------------------");
+        println!("  File     : {}", outcome.output.display());
+        println!("  Size     : {}", format::size(outcome.size));
+        println!("  Length   : {}", format::duration(outcome.out_duration));
+        if let Some((w, h, fps)) = outcome.out_format {
+            println!(
+                "  Video    : {w}{}{h} @ {} fps",
+                crate::theme::glyph::TIMES,
+                format::fps(fps)
+            );
+        }
+        println!("  Took     : {}", format::duration(outcome.elapsed));
+    } else {
+        println!("  The download did not finish. Nothing usable was written.");
+        if let Some(error) = &outcome.error {
+            println!("  Reason: {error}");
+        }
     }
 
     Ok(outcome.ok)

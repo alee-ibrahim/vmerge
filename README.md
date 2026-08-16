@@ -1,7 +1,9 @@
 # vmerge
 
 Joins video clips into one `.mp4` with a real terminal UI: arrow-key selection,
-in-place reordering, and live progress bars.
+in-place reordering, and live progress bars. It will also
+[fetch a video from a link](#downloading-a-video) if you have not got the clip
+yet.
 
 Build:
 
@@ -125,6 +127,7 @@ order you dropped them.
 | `space` | mark a clip |
 | `del` | remove marked clips, or the selected one |
 | `a` | add clips (type or paste a path) |
+| `u` | **download a video** from a link |
 | `c` | clear the list |
 | `n` | sort by filename (1, 2, 10 — not 1, 10, 2) |
 | `m` | release/recapture the mouse |
@@ -135,7 +138,7 @@ order you dropped them.
 | `t` | target size and framerate |
 | `e` | encoder (auto ⇄ cpu) |
 | `r` | force a re-encode of every clip |
-| `esc` | clear marks, close a dialog, or cancel a running merge |
+| `esc` | clear marks, close a dialog, or cancel a running merge or download |
 | `x` | exit |
 
 ### Mouse
@@ -160,6 +163,97 @@ terminals with bracketed paste (Windows Terminal) deliver the whole path as one
 event, and on older consoles a run of characters arriving faster than anyone can
 type is treated as pasted text. Either way it lands in the add prompt, where you
 can check it before it is added.
+
+### Downloading a video
+
+`u` takes a link instead of a file. It asks how much of the video you want, then
+fetches that one video into the current folder and stops — it is a job of its
+own, not a way of adding clips, so nothing is merged and the clip list is left
+exactly as it was. `--download <URL>` is the same job without the screen.
+
+```
+MERGE-VIDEOS.exe --download "https://www.youtube.com/watch?v=..." --download-quality 720p
+```
+
+| Choice | Gets |
+| --- | --- |
+| `best` | whatever the site has, at the highest resolution |
+| `1080p` `720p` `480p` | a hard cap, not a preference — 720p means 720p |
+| `audio` | an `.m4a`, no picture |
+
+Anything but `audio` arrives as an `.mp4`, preferring H.264 and AAC within the
+resolution you asked for — which is exactly what the merge side then joins
+without re-encoding anything. Resolution is still the first thing sorted on, or
+a 360p H.264 stream would beat a 1080p VP9 one and the cap would mean nothing.
+
+The work is done by [yt-dlp](https://github.com/yt-dlp/yt-dlp), which covers
+YouTube and around 1800 other sites and uses the ffmpeg this program already
+installed. Two things about it are worth knowing:
+
+- **It is fetched only when you first use a link.** Almost every run of this
+  program joins clips that are already on disk, so an 18 MB download during
+  first-time setup would be charged to people who will never need it. When it
+  does happen it draws the same bar ffmpeg setup does, and the executable is
+  checked against the `SHA2-256SUMS` published beside it — matched by name, so
+  the ARM build's digest can never be checked against the x86 build's bytes.
+- **It goes stale, so it keeps itself current.** An ffmpeg from two years ago
+  still joins clips; a yt-dlp from two years ago fails, because the sites it
+  reads change underneath it and upstream ships a fix most weeks. A copy this
+  program installed updates itself before use if it has not been checked in a
+  fortnight. A copy already on your `PATH` is normally left alone — it is yours —
+  but yt-dlp names its versions after their release date, so one more than three
+  months old is passed over in favour of an installed copy, and it says why:
+
+```
+  The yt-dlp on your PATH was released 250 days ago, which is old enough
+  to be refused by most video sites. Leaving it alone and installing
+  a copy this program can keep up to date instead.
+```
+
+  Without that, an eight-month-old package manager install produces
+  `HTTP Error 403: Forbidden` and an error about streaming protocols that nobody
+  could reasonably connect back to it.
+
+**YouTube needs a JavaScript engine.** It hands out video links behind a script
+puzzle, and yt-dlp has to run an engine to answer it. yt-dlp enables
+[Deno](https://deno.com) and nothing else by default, so a machine with Node.js
+installed — which is most of them — counts as having no engine at all. This looks
+for `deno`, `node` and `bun` on `PATH` and names whatever it finds, which costs
+one flag and is the difference between a download working and this:
+
+```
+  WARNING: [youtube] No supported JavaScript runtime could be found...
+  ERROR: unable to download video data: HTTP Error 403: Forbidden
+```
+
+If you have neither engine, install [Node.js](https://nodejs.org) or Deno and
+this will find it on its own.
+
+**`403 Forbidden` also happens at random.** It is the most misleading thing
+yt-dlp says: it reads like a blocked network or a private video, and it is
+usually neither. Measured on one link, three identical runs gave two immediate
+successes and one refusal — same video, same quality, same formats. yt-dlp's own
+`--retries` re-requests the *same* URL, which is no use when that URL is the
+thing being refused, so the whole extraction is run again to get fresh ones, up
+to three times. Both causes get a sentence added to the error saying which one
+it was, so a genuinely missing engine is never mistaken for bad luck.
+
+Where the finished file went is read from a file, not from yt-dlp's console
+output. yt-dlp re-encodes what it prints into something the console can render,
+and on Windows that quietly drops what will not fit: a video titled
+`Chill Mix 🎧 Vol 85` is printed back without the emoji, so the path names a file
+that does not exist and a download that worked perfectly is reported as lost.
+`--print-to-file` writes UTF-8 and changes nothing. If the name it records leads
+nowhere anyway, the newest file in the folder is used rather than giving up.
+
+Partial files go to a hidden working folder and only the finished video is moved
+out, so stopping a download leaves nothing half-written behind — the same reason
+merges work in `_merge_temp` rather than in place. Best video and best audio
+usually arrive as two separate files, so the bar runs to 100% twice; the screen
+says which stream is arriving rather than letting that read as lost progress.
+
+Playlists are not supported: a link that carries one alongside a video gets the
+video, and a bare playlist link gets its first entry.
 
 ### Updating itself
 
@@ -235,7 +329,10 @@ MERGE-VIDEOS.exe --no-tui a.mp4 b.mp4 --quality small --encoder cpu
 | `--quality` | `visually-lossless` \| `high` \| `medium` \| `small` |
 | `--encoder` | `auto` \| `cpu` \| `nvenc` \| `qsv` \| `amf` |
 | `--force-reencode` | re-encode even when clips already match |
+| `--download <url>` | download that one video and stop; nothing is merged |
+| `--download-quality` | `best` \| `1080p` \| `720p` \| `480p` \| `audio` |
 | `--skip-ffmpeg-download` | fail instead of downloading ffmpeg |
+| `--skip-ytdlp-download` | fail instead of downloading yt-dlp |
 | `--no-update` | do not look for a newer version on start |
 | `--no-tui`, `--no-pause` | plain output; do not wait for a keypress |
 

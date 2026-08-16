@@ -1,6 +1,11 @@
 target/
 ffmpeg/
 
+# yt-dlp installs itself here the first time a link is downloaded. Unlike
+# ffmpeg it is not mirrored in this repository: it goes stale in weeks, so a
+# committed copy would be wrong long before anyone noticed.
+yt-dlp/
+
 # The built binary. It changes on every build, so committing it grows history
 # on each commit; the vendored ffmpeg archive below is a one-off by comparison.
 MERGE-VIDEOS.exe
