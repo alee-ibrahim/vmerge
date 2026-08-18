@@ -109,10 +109,12 @@ fn clicked(app: &mut App, click: Click) {
         Click::Ignore => {}
         Click::Command(c) => match app.screen {
             Screen::Browse => command(app, c),
-            Screen::Result(_) | Screen::Fetched(_) => result_command(app, c),
-            // Cancelling a merge or a download stays on the keyboard: a stray
-            // click should not be able to throw away work in progress.
-            Screen::Merging(_) | Screen::Fetching(_) => {}
+            Screen::Result(_) | Screen::Fetched(_) | Screen::Converted(_) => {
+                result_command(app, c)
+            }
+            // Cancelling a job stays on the keyboard: a stray click should not be
+            // able to throw away work in progress.
+            Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_) => {}
         },
     }
 }
@@ -154,7 +156,7 @@ fn key_pressed(app: &mut App, key: KeyEvent) -> io::Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
-        if matches!(app.screen, Screen::Merging(_) | Screen::Fetching(_)) {
+        if matches!(app.screen, Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_)) {
             app.request_cancel();
         } else {
             app.quit = true;
@@ -182,13 +184,13 @@ fn key_pressed(app: &mut App, key: KeyEvent) -> io::Result<()> {
 
     match &app.screen {
         Screen::Browse => browse_key(app, key),
-        Screen::Merging(_) | Screen::Fetching(_) => {
+        Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_) => {
             if matches!(key.code, KeyCode::Esc) {
                 app.request_cancel();
             }
             Ok(())
         }
-        Screen::Result(_) | Screen::Fetched(_) => {
+        Screen::Result(_) | Screen::Fetched(_) | Screen::Converted(_) => {
             result_key(app, key);
             Ok(())
         }
@@ -291,6 +293,7 @@ fn command(app: &mut App, c: char) {
             app.say(note, Kind::Good);
         }
         'u' => app.prompt_fetch(),
+        'v' => app.menu_convert(),
         'm' => toggle_mouse(app),
         's' => app.request_merge(),
         'x' => app.quit = true,
@@ -371,6 +374,7 @@ fn answer(app: &mut App, yes: bool) {
             }
         }
         Overlay::Confirm(Confirm::CancelMerge)
+        | Overlay::Confirm(Confirm::CancelConvert)
         | Overlay::Confirm(Confirm::CancelFetch)
         | Overlay::Confirm(Confirm::StopRecording) => {
             if yes {

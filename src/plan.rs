@@ -253,6 +253,7 @@ mod tests {
         ClipInfo {
             path: PathBuf::from("x.mp4"),
             name: "x.mp4".into(),
+            has_video: true,
             video_codec: "h264".into(),
             width: w,
             height: h,

@@ -291,6 +291,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(FetchEvent)) -> 
     let mut outcome = Outcome {
         ok: false,
         output: job.folder.clone(),
+        outputs: Vec::new(),
         size: 0,
         out_duration: 0.0,
         out_format: None,
@@ -388,6 +389,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(FetchEvent)) -> 
     outcome.recorded = live == Live::Now;
     outcome.ok = true;
     outcome.output = file.clone();
+    outcome.outputs = vec![file.clone()];
     outcome.size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
     match probe::clip_info(&job.tools.ffprobe, &file) {
         Some(info) => {

@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, bail};
 
 use crate::collect;
+use crate::convert;
 use crate::encoder::{EncoderPref, Quality};
 use crate::fetch::{self, FetchEvent, FetchQuality, Stage};
 use crate::ffmpeg::Tools;
@@ -190,6 +191,186 @@ pub fn run(tools: Arc<Tools>, root: &Path, options: Options) -> Result<bool> {
     }
 
     Ok(outcome.ok)
+}
+
+pub struct Conversion {
+    pub files: Vec<PathBuf>,
+    pub folder: Option<PathBuf>,
+    pub target: convert::Target,
+    pub quality: Quality,
+    pub encoder: EncoderPref,
+    pub force_reencode: bool,
+}
+
+/// `--convert-to <FORMAT>` : write every input out again in that format and stop.
+///
+/// Deliberately not interactive even on a terminal, the same as `--download`: the
+/// flag already names the format, which is the only thing the picker would have
+/// asked, and a script that has to know whether it worked gets the exit code.
+pub fn convert(tools: Arc<Tools>, root: &Path, options: Conversion) -> Result<bool> {
+    let (selected, source_folder) = choose_conversion_inputs(root, &options)?;
+    if selected.is_empty() {
+        println!();
+        println!("  Nothing to convert.");
+        println!();
+        println!("  Folder checked: {}", source_folder.display());
+        println!("  Formats read:   {}", collect::VIDEO_EXTENSIONS.join(" "));
+        println!("                  {}", collect::AUDIO_EXTENSIONS.join(" "));
+        return Ok(false);
+    }
+
+    println!();
+    println!("  Converting to : {}", options.target.ext().to_uppercase());
+    println!("  Folder        : {}", source_folder.display());
+    println!();
+
+    let mut clips: Vec<ClipInfo> = Vec::new();
+    for (i, path) in selected.iter().enumerate() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        print!("  {:>3}. {}", i + 1, format::pad(&name, 40));
+        let _ = std::io::stdout().flush();
+        match probe::clip_info(&tools.ffprobe, path) {
+            Some(info) => {
+                // What happens to this file is decided before anything runs, so
+                // the list doubles as the plan.
+                let planned = match convert::decide(&info, options.target, options.force_reencode) {
+                    convert::Move::Copy => "remux".to_string(),
+                    convert::Move::Encode => "re-encode".to_string(),
+                    convert::Move::Skip(why) => format!("SKIPPED - it {why}"),
+                };
+                println!(
+                    "  {:>9}  {:<10} {:>8}  {}",
+                    info.dimensions(),
+                    info.codec_label(),
+                    format::duration(info.duration),
+                    planned
+                );
+                clips.push(info);
+            }
+            None => println!("  [SKIPPED - neither video nor audio]"),
+        }
+    }
+
+    if clips.is_empty() {
+        bail!("None of the files could be read.");
+    }
+    println!();
+
+    let job = convert::Job {
+        tools,
+        clips,
+        target: options.target,
+        quality: options.quality,
+        encoder: options.encoder,
+        force_reencode: options.force_reencode,
+    };
+
+    // ctrl-c stops after the file in progress rather than killing the process, so
+    // a long batch keeps everything it had finished.
+    let cancel = proc::stop_on_interrupt();
+    let total = job.clips.len();
+    let tty = std::io::stdout().is_terminal();
+    let mut current_duration = 0.0f64;
+    let mut current_label = String::new();
+    let mut last_percent = u32::MAX;
+
+    let outcome = convert::run(&job, cancel, &mut |event| match event {
+        MergeEvent::Plan(line) => println!("  {line}"),
+        MergeEvent::Pass { .. } => println!(),
+        MergeEvent::SegmentStart { index, name, step, duration } => {
+            current_duration = duration;
+            last_percent = u32::MAX;
+            current_label = format!(
+                "  [{}/{}] {:<8} {}",
+                index + 1,
+                total,
+                step.verb(),
+                format::pad(&name, 34)
+            );
+            redraw(&current_label, false, tty);
+        }
+        MergeEvent::SegmentProgress { done, .. } => {
+            if current_duration <= 0.0 {
+                return;
+            }
+            let percent = ((done / current_duration).clamp(0.0, 1.0) * 100.0) as u32;
+            if percent != last_percent {
+                last_percent = percent;
+                redraw(&format!("{current_label} {percent:>3}%"), false, tty);
+            }
+        }
+        MergeEvent::SegmentEnd { step, ok, elapsed, .. } => {
+            let mark = if ok {
+                format!("{} in {}", step.past(), format::short_duration(elapsed))
+            } else {
+                "not written".to_string()
+            };
+            redraw(&format!("{current_label} {mark}"), true, tty);
+        }
+        // A conversion never joins anything, so these cannot arrive.
+        MergeEvent::JoinStart | MergeEvent::JoinProgress { .. } => {}
+        MergeEvent::Warning(text) => redraw(&format!("  {text}"), true, tty),
+        MergeEvent::Finished(_) => {}
+    });
+
+    println!();
+    if outcome.ok {
+        println!("  -------------------------------------------");
+        println!("  DONE");
+        println!("  -------------------------------------------");
+        match outcome.outputs.len() {
+            1 => println!("  File     : {}", outcome.output.display()),
+            n => {
+                println!("  Files    : {n}");
+                println!("  Folder   : {}", source_folder.display());
+                for path in &outcome.outputs {
+                    println!(
+                        "             {}",
+                        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    );
+                }
+            }
+        }
+        println!("  Size     : {}", format::size(outcome.size));
+        println!("  Took     : {}", format::duration(outcome.elapsed));
+    } else {
+        println!("  Nothing was converted.");
+        if let Some(error) = &outcome.error {
+            println!("  Reason: {error}");
+        }
+    }
+    for warning in &outcome.warnings {
+        println!("  Note: {warning}");
+    }
+
+    Ok(outcome.ok)
+}
+
+/// Which files a conversion runs over: an explicit list wins, and otherwise every
+/// video and audio file in the folder, in natural filename order.
+fn choose_conversion_inputs(root: &Path, options: &Conversion) -> Result<(Vec<PathBuf>, PathBuf)> {
+    if !options.files.is_empty() {
+        let mut selected = Vec::new();
+        for file in &options.files {
+            if file.is_file() {
+                selected.push(file.clone());
+            } else {
+                println!("  Not found, ignoring: {}", file.display());
+            }
+        }
+        let folder = selected
+            .first()
+            .and_then(|f| f.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        return Ok((selected, folder));
+    }
+
+    let folder = options.folder.clone().unwrap_or_else(|| root.to_path_buf());
+    if !folder.is_dir() {
+        bail!("Folder not found: {}", folder.display());
+    }
+    Ok((collect::media_files_in_folder(&folder, None), folder))
 }
 
 pub struct Download {

@@ -175,9 +175,11 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
 
     match &app.screen {
         Screen::Browse => draw_browse(frame, app, ui, area),
-        Screen::Merging(_) => draw_merging(frame, area, app, ui),
+        Screen::Merging(view) | Screen::Converting(view) => {
+            draw_progress(frame, area, view, ui)
+        }
         Screen::Fetching(view) => draw_fetching(frame, area, view, ui),
-        Screen::Result(outcome) | Screen::Fetched(outcome) => {
+        Screen::Result(outcome) | Screen::Fetched(outcome) | Screen::Converted(outcome) => {
             draw_result(frame, area, outcome, ui)
         }
     }
@@ -436,7 +438,8 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
         // Three rows rather than two: buttons take the room their padding needs,
         // and a row that runs off a narrow terminal loses its last button
         // entirely. Grouped by what they are for - the merge and how it comes
-        // out, then editing the list, then the program itself.
+        // out, then the other jobs and the list they act on, then the program
+        // itself.
         &[
             &[
                 only_if(any, primary("S", "START MERGE", Click::Command('s'))),
@@ -446,15 +449,16 @@ fn draw_browse(frame: &mut Frame, app: &App, ui: &mut UiState, frame_area: Rect)
                 hint("e", "encoder", Some(Click::Command('e'))),
             ],
             &[
-                only_if(any, hint("space", "mark", Some(Click::Mark))),
-                only_if(any, hint("del", "remove", Some(Click::Remove))),
-                hint("a", "add", Some(Click::Command('a'))),
+                only_if(any, hint("v", "convert", Some(Click::Command('v')))),
                 // Never greyed out: a link needs no clips to work on, and with
                 // an empty list it is the second thing worth doing.
                 hint("u", "download", Some(Click::Command('u'))),
-                only_if(any, hint("c", "clear", Some(Click::Command('c')))),
+                hint("a", "add", Some(Click::Command('a'))),
+                only_if(any, hint("space", "mark", Some(Click::Mark))),
+                only_if(any, hint("del", "remove", Some(Click::Remove))),
             ],
             &[
+                only_if(any, hint("c", "clear", Some(Click::Command('c')))),
                 hint("m", mouse_label, Some(Click::Command('m'))),
                 hint("?", "more", Some(Click::Command('?'))),
                 hint("x", "exit", Some(Click::Command('x'))),
@@ -602,8 +606,10 @@ fn draw_clip_list(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
             (" ", Style::default())
         };
 
-        let audio = if clip.has_audio { clip.audio_codec.as_str() } else { glyph::NONE };
-        let codec = format!("{}{}{}", clip.video_codec, glyph::DOT, audio);
+        // Every one of these reads "—" rather than a zero for a file that has no
+        // picture: an mp3 in the list is a conversion waiting to happen, not a
+        // clip that measured 0x0 at 0 fps.
+        let codec = clip.codec_label();
 
         lines.push(Line::from(vec![
             Span::raw(" "),
@@ -617,11 +623,11 @@ fn draw_clip_list(frame: &mut Frame, area: Rect, app: &App, ui: &mut UiState) {
             ),
             Span::styled("  ", row_style),
             Span::styled(
-                format!("{:>w$}", format!("{}{}{}", clip.width, glyph::TIMES, clip.height), w = columns.size as usize),
+                format!("{:>w$}", clip.dimensions(), w = columns.size as usize),
                 value_style,
             ),
             Span::styled("  ", row_style),
-            Span::styled(format!("{:>w$}", format::fps(clip.fps), w = columns.fps as usize), value_style),
+            Span::styled(format!("{:>w$}", clip.fps_label(), w = columns.fps as usize), value_style),
             Span::styled("  ", row_style),
             Span::styled(format!("{:<w$}", format::ellipsize(&codec, columns.codec as usize), w = columns.codec as usize), value_style),
             Span::styled("  ", row_style),
@@ -703,10 +709,10 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App, ui: &UiState, plan: &[Str
 
 // -------------------------------------------------------------------- merging
 
-fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState) {
-    let Screen::Merging(view) = &app.screen else {
-        return;
-    };
+/// The merge screen, and the conversion screen: one row per clip, a bar each, and
+/// one bar for the lot. The two jobs differ in three words, so they share the
+/// drawing rather than having a copy each that can drift apart.
+fn draw_progress(frame: &mut Frame, frame_area: Rect, view: &crate::app::MergeView, ui: &mut UiState) {
     let area = page(frame_area);
     let theme = ui.theme;
 
@@ -727,17 +733,13 @@ fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState
     ])
     .areas(area);
 
-    let name = view
-        .output
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let done = view.rows.iter().filter(|r| r.state == SegState::Done).count();
+    let what = if view.joins { "clips" } else { "files" };
     header(
         frame,
         head,
         ui,
-        &format!("{done}/{} clips {} {name}", view.rows.len(), glyph::DOT),
+        &format!("{done}/{} {what} {} {}", view.rows.len(), glyph::DOT, view.label),
     );
     rule(frame, top_rule, ui);
 
@@ -763,7 +765,11 @@ fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState
         Constraint::Length(1),
     ])
     .areas(bar_area);
-    let stage = if view.joining { "joining" } else { "preparing clips" };
+    let stage = match (view.joining, view.joins) {
+        (true, _) => "joining",
+        (false, true) => "preparing clips",
+        (false, false) => "converting",
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw("  "),
@@ -805,7 +811,8 @@ fn draw_merging(frame: &mut Frame, frame_area: Rect, app: &App, ui: &mut UiState
     // Stopping stays on the keyboard: a stray click must not be able to throw
     // away work already done, so this is a reminder and not a button.
     let ground = ui.theme.base;
-    hint_bar(frame, hints, ui, ground, &[&[nav("esc", "stop the merge")]]);
+    let stop = if view.joins { "stop the merge" } else { "stop converting" };
+    hint_bar(frame, hints, ui, ground, &[&[nav("esc", stop)]]);
 }
 
 fn draw_segment_rows(frame: &mut Frame, area: Rect, view: &crate::app::MergeView, ui: &mut UiState) {
@@ -1072,6 +1079,10 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
 
 // --------------------------------------------------------------------- result
 
+/// How many of a batch's file names the report lists before it starts counting
+/// instead. Enough to recognise what happened, few enough to stay a summary.
+const RESULT_NAMES: usize = 8;
+
 fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut UiState) {
     let area = page(frame_area);
     let theme = ui.theme;
@@ -1098,7 +1109,36 @@ fn draw_result(frame: &mut Frame, frame_area: Rect, outcome: &Outcome, ui: &mut 
         ]));
     };
 
-    if outcome.ok {
+    if outcome.ok && outcome.outputs.len() > 1 {
+        // A batch conversion wrote a file per input, so naming one of them would
+        // be picking a favourite. The count, where they are and what they came to
+        // is the honest summary, and then the names themselves.
+        let folder = outcome.output.parent().unwrap_or(&outcome.output);
+        field("FILES", format!("{} written", outcome.outputs.len()));
+        field("FOLDER", display_path(folder));
+        field("SIZE", format::size(outcome.size));
+        field("LENGTH", format::duration(outcome.out_duration));
+        field("TOOK", format::duration(outcome.elapsed));
+        lines.push(Line::raw(""));
+        for path in outcome.outputs.iter().take(RESULT_NAMES) {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<8}", ""), theme.label()),
+                Span::styled(name, theme.dim()),
+            ]));
+        }
+        if outcome.outputs.len() > RESULT_NAMES {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<8}", ""), theme.label()),
+                Span::styled(
+                    format!("and {} more", outcome.outputs.len() - RESULT_NAMES),
+                    theme.label(),
+                ),
+            ]));
+        }
+    } else if outcome.ok {
         field("FILE", display_path(&outcome.output));
         field("SIZE", format::size(outcome.size));
         field("LENGTH", format::duration(outcome.out_duration));
@@ -1333,12 +1373,15 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &Menu, ui: &mut UiState) {
     }
     frame.render_widget(Paragraph::new(lines), items_area);
 
+    // Only nine of them can have a key, so a longer list says so rather than
+    // promising a number for the tenth.
+    let how = if menu.items.len() > 9 {
+        "click a line, or press 1-9   "
+    } else {
+        "click a line, or press its number   "
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            "click a line, or press its number   ",
-            theme.label(),
-        ))
-        .alignment(Alignment::Right),
+        Paragraph::new(Line::styled(how, theme.label())).alignment(Alignment::Right),
         hint_area,
     );
     hint_bar(
@@ -1387,6 +1430,29 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
                 Span::raw("  "),
                 Span::styled("ffmpeg is stopped and the part-finished file is removed.", theme.dim()),
             ])],
+            vec![
+                danger("y", "stop it", Click::Answer(true)),
+                hint("n", "keep going", Some(Click::Answer(false))),
+            ],
+        ),
+        Confirm::CancelConvert => (
+            "Stop converting?",
+            vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "The files already converted are kept - they are finished.",
+                        theme.dim(),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "The one in progress is removed, and the rest are not started.",
+                        theme.dim(),
+                    ),
+                ]),
+            ],
             vec![
                 danger("y", "stop it", Click::Answer(true)),
                 hint("n", "keep going", Some(Click::Answer(false))),

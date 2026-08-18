@@ -16,9 +16,16 @@
 //! `--download <URL>` is the same job without the screen. It is a separate job
 //! rather than a way of adding clips - it fetches the file and stops, and yt-dlp
 //! is only installed the first time a link is actually given.
+//!
+//! Pressing V converts instead of joining: every file in the list is written out
+//! again in the format picked - mkv, mov, webm, gif, mp3 and the rest - beside
+//! the original, at the same size and length. Where the streams already suit the
+//! new container that is a remux rather than a re-encode, so it takes seconds and
+//! loses nothing. `--convert-to <FORMAT>` is the same job without the screen.
 
 mod app;
 mod collect;
+mod convert;
 mod encoder;
 mod fetch;
 mod ffmpeg;
@@ -48,6 +55,7 @@ use ratatui::crossterm::event::{
 };
 
 use crate::app::{App, Screen};
+use crate::convert::Target;
 use crate::encoder::{EncoderPref, Quality};
 use crate::fetch::FetchQuality;
 use crate::ffmpeg::Reporter;
@@ -88,6 +96,11 @@ struct Args {
     /// Re-encode every clip even when they already match.
     #[arg(long)]
     force_reencode: bool,
+
+    /// Convert the files given (or every file in --folder) into this format and
+    /// stop. Nothing is merged.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    convert_to: Option<Target>,
 
     /// Download this video and stop. Nothing is merged.
     #[arg(long, value_name = "URL")]
@@ -219,6 +232,25 @@ fn real_main(args: Args) -> Result<bool> {
     let mut files = args.files.clone();
     if let Some(list) = &args.file_list {
         files.extend(read_file_list(list)?);
+    }
+
+    // Converting is a job of its own too: it writes a file per input and stops,
+    // so a clip order and an output name have nothing to say about it. It stays
+    // non-interactive even on a terminal - the flag names the format, which is
+    // the only thing the screen would have asked.
+    if let Some(target) = args.convert_to {
+        return oneshot::convert(
+            tools,
+            &root,
+            oneshot::Conversion {
+                files,
+                folder: args.folder,
+                target,
+                quality: args.quality,
+                encoder: args.encoder,
+                force_reencode: args.force_reencode,
+            },
+        );
     }
 
     // Drawing a full-screen UI into a pipe or a log file helps nobody, and
@@ -432,7 +464,12 @@ fn run_tui(
         while !app.quit {
             // A merge or download screen has a moving clock, so it redraws on
             // every tick; an idle list only redraws when something changed.
-            if dirty || matches!(app.screen, Screen::Merging(_) | Screen::Fetching(_)) {
+            if dirty
+                || matches!(
+                    app.screen,
+                    Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_)
+                )
+            {
                 terminal.draw(|frame| ui::draw(frame, &app, &mut ui_state))?;
             }
             dirty = input::pump(&mut app, &mut ui_state, TICK)?;
@@ -454,7 +491,13 @@ fn run_tui(
     if let Some(outcome) = app.outcome() {
         println!();
         if outcome.ok {
-            println!("  Wrote {}", outcome.output.display());
+            match outcome.outputs.len() {
+                0 | 1 => println!("  Wrote {}", outcome.output.display()),
+                n => println!(
+                    "  Wrote {n} files to {}",
+                    outcome.output.parent().unwrap_or(&outcome.output).display()
+                ),
+            }
             println!(
                 "  {}, {}, took {}",
                 format::size(outcome.size),

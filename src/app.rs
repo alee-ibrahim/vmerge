@@ -11,6 +11,7 @@ use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use crate::collect::{self, AddEvent};
+use crate::convert;
 use crate::encoder::{EncoderPref, Quality};
 use crate::fetch::{self, FetchEvent, FetchQuality, Stage};
 use crate::ffmpeg::Tools;
@@ -67,9 +68,12 @@ pub enum TargetChoice {
 pub enum MenuKind {
     Quality,
     Target(Vec<TargetChoice>),
-    /// Which stream to take from a link. Unlike the other two this is not a
+    /// Which stream to take from a link. Unlike the first two this is not a
     /// setting being changed - picking one starts the download.
     Fetch,
+    /// Which format to convert into. Also starts the job rather than storing a
+    /// setting, for the same reason.
+    Convert,
 }
 
 pub struct Menu {
@@ -83,6 +87,9 @@ pub struct Menu {
 pub enum Confirm {
     Overwrite(PathBuf),
     CancelMerge,
+    /// Stopping a batch conversion. Its own question because the answer is
+    /// different: the files already converted are kept.
+    CancelConvert,
     CancelFetch,
     /// Finishing a live capture on purpose. Not a cancellation in anything but
     /// the mechanism: it is how a recording ends, and it keeps the file.
@@ -125,6 +132,7 @@ impl HelpSheet {
                     vec![
                         ("a   f", "add files or a folder"),
                         ("u", "download from a link"),
+                        ("v", "convert to another format"),
                         ("c", "clear the list"),
                         ("n", "sort by filename"),
                     ],
@@ -177,9 +185,21 @@ pub struct SegRow {
     pub elapsed: f64,
 }
 
-/// What the merge screen shows. Rebuilt each time a merge starts.
+/// What the progress screen shows. Rebuilt each time a merge or a conversion
+/// starts.
+///
+/// Both jobs are the same shape on screen - a row per clip, a bar per row, one
+/// overall bar - so they share the view rather than having two of it. What
+/// differs is carried in `joins` and `label`: a conversion never joins anything,
+/// so the last slice of the bar is not held back for a step that will not happen.
 pub struct MergeView {
-    pub output: PathBuf,
+    /// What the header says after the counts: the output name for a merge, or the
+    /// format everything is being converted to. A conversion has no single output
+    /// to name - each file lands beside its own source, and those need not even be
+    /// in one folder - so the format is the honest answer.
+    pub label: String,
+    /// Whether a join follows the per-clip pass. False for a conversion.
+    pub joins: bool,
     pub plan: Vec<String>,
     pub rows: Vec<SegRow>,
     pub active: Option<usize>,
@@ -196,15 +216,27 @@ impl MergeView {
     /// quick, so it gets the last slice of the bar rather than half of it.
     const JOIN_SHARE: f64 = 0.15;
 
-    pub(crate) fn new(output: PathBuf, clips: &[Entry]) -> Self {
+    pub(crate) fn new(output: &Path, clips: &[Entry]) -> Self {
+        let label = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let clips: Vec<ClipInfo> = clips.iter().map(|e| e.clip.clone()).collect();
+        Self::for_job(label, true, &clips)
+    }
+
+    /// The same screen for a conversion: one row per file, and no join at the end.
+    pub(crate) fn converting(target: convert::Target, clips: &[ClipInfo]) -> Self {
+        Self::for_job(format!("as {}", target.ext().to_uppercase()), false, clips)
+    }
+
+    fn for_job(label: String, joins: bool, clips: &[ClipInfo]) -> Self {
         Self {
-            output,
+            label,
+            joins,
             plan: Vec::new(),
             rows: clips
                 .iter()
-                .map(|e| SegRow {
-                    name: e.clip.name.clone(),
-                    duration: e.clip.duration,
+                .map(|clip| SegRow {
+                    name: clip.name.clone(),
+                    duration: clip.duration,
                     step: Step::Copy,
                     done: 0.0,
                     state: SegState::Queued,
@@ -217,7 +249,7 @@ impl MergeView {
             join_total: 0.0,
             attempt: 1,
             started: Instant::now(),
-            total_duration: clips.iter().map(|e| e.clip.duration).sum(),
+            total_duration: clips.iter().map(|c| c.duration).sum(),
         }
     }
 
@@ -226,6 +258,10 @@ impl MergeView {
         if self.total_duration <= 0.0 {
             return if self.joining { 0.9 } else { 0.0 };
         }
+        // A conversion has no join to hold room for, so the per-file pass is the
+        // whole bar. Reserving the last 15% for a step that never runs would
+        // leave a finished job sitting at 85%.
+        let join_share = if self.joins { Self::JOIN_SHARE } else { 0.0 };
         let prepared: f64 = self
             .rows
             .iter()
@@ -235,11 +271,11 @@ impl MergeView {
                 _ => 0.0,
             })
             .sum();
-        let prepare = (prepared / self.total_duration).clamp(0.0, 1.0) * (1.0 - Self::JOIN_SHARE);
+        let prepare = (prepared / self.total_duration).clamp(0.0, 1.0) * (1.0 - join_share);
         let join = if self.join_total > 0.0 {
-            (self.join_done / self.join_total).clamp(0.0, 1.0) * Self::JOIN_SHARE
+            (self.join_done / self.join_total).clamp(0.0, 1.0) * join_share
         } else if self.joining {
-            Self::JOIN_SHARE * 0.5
+            join_share * 0.5
         } else {
             0.0
         };
@@ -339,12 +375,17 @@ impl FetchView {
 pub enum Screen {
     Browse,
     Merging(MergeView),
+    /// Files being converted one by one. Drawn by the merge screen, because it is
+    /// the same picture.
+    Converting(MergeView),
     Fetching(FetchView),
     Result(Box<Outcome>),
     /// The same report as `Result`, from a download rather than a merge. Kept
     /// apart only so that returning to the list does not renumber the merge
     /// output after a download that never touched it.
     Fetched(Box<Outcome>),
+    /// And the same again for a conversion, which also leaves merged.mp4 alone.
+    Converted(Box<Outcome>),
 }
 
 pub struct App {
@@ -369,6 +410,9 @@ pub struct App {
     /// Which stream the download picker opens on. Whatever was taken last time
     /// is usually what is wanted again.
     pub fetch_quality: FetchQuality,
+    /// Which format the convert picker opens on, for the same reason: converting
+    /// a folder usually means converting all of it the same way.
+    pub convert_target: convert::Target,
     /// Where yt-dlp is installed if it has to be fetched, and where an existing
     /// copy is looked for. Set by main, because only main knows where the
     /// executable actually lives.
@@ -399,6 +443,7 @@ impl App {
             mouse: true,
             quit: false,
             fetch_quality: FetchQuality::P1080,
+            convert_target: convert::Target::Mp4,
             tool_root: root.clone(),
             tool_search: vec![root.clone()],
             allow_ytdlp_download: true,
@@ -583,7 +628,7 @@ impl App {
     /// through the add prompt: what happens next is a download and then nothing,
     /// which is not what "add clips" promises.
     pub fn prompt_fetch(&mut self) {
-        if matches!(self.screen, Screen::Merging(_) | Screen::Fetching(_)) {
+        if matches!(self.screen, Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_)) {
             return;
         }
         self.overlay = Overlay::Prompt(Prompt {
@@ -612,6 +657,57 @@ impl App {
             items,
             cursor,
         });
+    }
+
+    /// The format picker. Like the download picker, choosing an item starts the
+    /// job rather than remembering a preference for later.
+    pub fn menu_convert(&mut self) {
+        if matches!(self.screen, Screen::Merging(_) | Screen::Converting(_) | Screen::Fetching(_)) {
+            return;
+        }
+        if self.clips.is_empty() {
+            self.say("Nothing to convert yet - press A or drag some files in.", Kind::Warn);
+            return;
+        }
+        if self.probing.is_some() {
+            self.say("Still reading files - one moment.", Kind::Warn);
+            return;
+        }
+
+        let chosen = self.convert_selection();
+        let items = convert::Target::ALL
+            .iter()
+            .map(|t| (t.label().to_string(), t.note().to_string()))
+            .collect();
+        let cursor = convert::Target::ALL
+            .iter()
+            .position(|t| *t == self.convert_target)
+            .unwrap_or(0);
+        let marked = self.marked_count();
+        self.overlay = Overlay::Menu(Menu {
+            kind: MenuKind::Convert,
+            title: if marked > 0 {
+                format!("Convert {marked} marked file(s) to")
+            } else {
+                format!("Convert {} file(s) to", chosen.len())
+            },
+            note: "Each one becomes a file of its own beside the original, at the same size and \
+                   length. Nothing is merged, and nothing is replaced."
+                .into(),
+            items,
+            cursor,
+        });
+    }
+
+    /// Which files a conversion would act on: the marked ones if any are marked,
+    /// and otherwise all of them. The same rule the delete key follows, for the
+    /// same reason - marking is how a subset gets picked out.
+    fn convert_selection(&self) -> Vec<ClipInfo> {
+        if self.marked_count() > 0 {
+            self.clips.iter().filter(|e| e.marked).map(|e| e.clip.clone()).collect()
+        } else {
+            self.clip_list()
+        }
     }
 
     pub fn menu_quality(&mut self) {
@@ -821,6 +917,12 @@ impl App {
                 self.quality = quality;
                 self.say(format!("Quality set to {}", quality.label()), Kind::Good);
             }
+            MenuKind::Convert => {
+                let target = convert::Target::ALL[index];
+                self.close_overlay();
+                self.convert_target = target;
+                self.launch_convert(target);
+            }
             MenuKind::Fetch => {
                 let quality = FetchQuality::ALL[index];
                 // Taken before the overlay closes: closing the picker is also
@@ -880,6 +982,18 @@ impl App {
             self.say("Still reading files - one moment.", Kind::Warn);
             return;
         }
+        // Sound with no picture cannot be joined to anything. Said here, before a
+        // merge screen appears and fails one clip at a time.
+        if let Some(soundtrack) = self.clips.iter().find(|e| !e.clip.has_video) {
+            self.say(
+                format!(
+                    "{} has no picture, so it cannot be merged. Remove it, or press V to convert it.",
+                    soundtrack.clip.name
+                ),
+                Kind::Bad,
+            );
+            return;
+        }
         let Some(output) = self.resolved_output() else {
             return;
         };
@@ -913,7 +1027,7 @@ impl App {
     pub fn launch_merge(&mut self, output: PathBuf) {
         self.close_overlay();
         self.cancel = Arc::new(AtomicBool::new(false));
-        self.screen = Screen::Merging(MergeView::new(output.clone(), &self.clips));
+        self.screen = Screen::Merging(MergeView::new(&output, &self.clips));
 
         let job = merge::Job {
             tools: self.tools.clone(),
@@ -925,6 +1039,28 @@ impl App {
             target_override: self.target_override,
         };
         merge::spawn(job, self.cancel.clone(), self.tx.clone(), AppEvent::Merge);
+    }
+
+    // -------------------------------------------------------------- convert
+
+    pub fn launch_convert(&mut self, target: convert::Target) {
+        let clips = self.convert_selection();
+        if clips.is_empty() {
+            return;
+        }
+        self.close_overlay();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.screen = Screen::Converting(MergeView::converting(target, &clips));
+
+        let job = convert::Job {
+            tools: self.tools.clone(),
+            clips,
+            target,
+            quality: self.quality,
+            encoder: self.encoder,
+            force_reencode: self.force_reencode,
+        };
+        convert::spawn(job, self.cancel.clone(), self.tx.clone(), AppEvent::Merge);
     }
 
     // -------------------------------------------------------------- downloads
@@ -958,6 +1094,7 @@ impl App {
     pub fn request_cancel(&mut self) {
         match &self.screen {
             Screen::Merging(_) => self.overlay = Overlay::Confirm(Confirm::CancelMerge),
+            Screen::Converting(_) => self.overlay = Overlay::Confirm(Confirm::CancelConvert),
             Screen::Fetching(view) => {
                 // Stopping a recording keeps what it has and stopping a download
                 // throws it away, so the two cannot share a question.
@@ -976,10 +1113,12 @@ impl App {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// The report on screen, whichever of the two produced it.
+    /// The report on screen, whichever of the three jobs produced it.
     pub fn outcome(&self) -> Option<&Outcome> {
         match &self.screen {
-            Screen::Result(outcome) | Screen::Fetched(outcome) => Some(outcome),
+            Screen::Result(outcome) | Screen::Fetched(outcome) | Screen::Converted(outcome) => {
+                Some(outcome)
+            }
             _ => None,
         }
     }
@@ -1125,11 +1264,35 @@ impl App {
         }
     }
 
+    /// Both jobs report through `MergeEvent`, so which of them is running is read
+    /// off the screen rather than tracked separately: the two cannot disagree.
     fn handle_merge(&mut self, event: MergeEvent) {
-        // A finished merge switches screens; everything else updates the view.
+        let converting = matches!(self.screen, Screen::Converting(_));
+
+        // A finished job switches screens; everything else updates the view.
         if let MergeEvent::Finished(outcome) = event {
             let kind = if outcome.ok { Kind::Good } else { Kind::Bad };
-            let message = if outcome.cancelled {
+            // What was produced comes before how it ended, the same as a
+            // recording: a batch stopped half way still converted real files.
+            let message = if converting {
+                if outcome.ok {
+                    match outcome.outputs.len() {
+                        1 => format!(
+                            "Converted {}",
+                            outcome
+                                .output
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ),
+                        n => format!("Converted {n} files."),
+                    }
+                } else if outcome.cancelled {
+                    "Conversion stopped.".to_string()
+                } else {
+                    "That conversion failed.".to_string()
+                }
+            } else if outcome.cancelled {
                 "Merge cancelled.".to_string()
             } else if outcome.ok {
                 "Merge finished.".to_string()
@@ -1137,12 +1300,13 @@ impl App {
                 "That merge failed.".to_string()
             };
             self.say(message, kind);
-            self.screen = Screen::Result(outcome);
+            self.screen =
+                if converting { Screen::Converted(outcome) } else { Screen::Result(outcome) };
             self.close_overlay();
             return;
         }
 
-        let Screen::Merging(view) = &mut self.screen else {
+        let (Screen::Merging(view) | Screen::Converting(view)) = &mut self.screen else {
             return;
         };
 

@@ -77,7 +77,14 @@ pub enum MergeEvent {
 #[derive(Debug, Clone)]
 pub struct Outcome {
     pub ok: bool,
+    /// The file to show the user, and the one Explorer is pointed at. A merge and
+    /// a download write one file each; a conversion writes one per input, and
+    /// this is the first of them.
     pub output: PathBuf,
+    /// Every file the job wrote. One entry for a merge or a download, one per
+    /// input for a conversion - which is what the report reads to know whether it
+    /// is describing a file or a batch.
+    pub outputs: Vec<PathBuf>,
     pub size: u64,
     pub out_duration: f64,
     pub out_format: Option<(u32, u32, f64)>,
@@ -150,6 +157,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
     let mut outcome = Outcome {
         ok: false,
         output: output.clone(),
+        outputs: Vec::new(),
         size: 0,
         out_duration: 0.0,
         out_format: None,
@@ -162,6 +170,19 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
 
     if job.clips.is_empty() {
         outcome.error = Some("There are no clips to merge.".into());
+        return outcome;
+    }
+
+    // A file with sound and no picture is a perfectly good input for a conversion
+    // and no use at all here: every strategy below maps a video stream, so it
+    // would fail one clip at a time with an ffmpeg error rather than saying what
+    // is actually wrong.
+    if let Some(soundtrack) = job.clips.iter().find(|c| !c.has_video) {
+        outcome.error = Some(format!(
+            "{} has no picture in it, so there is nothing to join. \
+             Remove it, or convert it instead.",
+            soundtrack.name
+        ));
         return outcome;
     }
 
@@ -198,6 +219,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
     match result {
         Ok(()) if output.is_file() => {
             outcome.ok = true;
+            outcome.outputs = vec![output.clone()];
             outcome.size = fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
             if let Some(info) = probe::clip_info(&job.tools.ffprobe, &output) {
                 outcome.out_duration = info.duration;
@@ -643,7 +665,7 @@ fn write_concat_list(parts: &[PathBuf], list_path: &Path) -> std::io::Result<()>
 /// `-progress pipe:1` writes machine-readable key=value lines to stdout, which
 /// is what makes a real progress bar possible; `-nostats` silences the human
 /// version. stderr is captured so the tail can be reported if ffmpeg gives up.
-fn run_ffmpeg(
+pub(crate) fn run_ffmpeg(
     ffmpeg: &Path,
     args: &[String],
     cancel: &AtomicBool,

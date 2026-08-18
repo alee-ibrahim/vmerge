@@ -14,10 +14,30 @@ pub const VIDEO_EXTENSIONS: [&str; 17] = [
     "3gp", "3g2", "ogv", "asf",
 ];
 
-pub fn is_video(path: &Path) -> bool {
+/// Sound with no picture. Nothing to merge, but converting one of these into
+/// another audio format is half of what a converter is for, so they are allowed
+/// into the list and the merge refuses them instead.
+pub const AUDIO_EXTENSIONS: [&str; 12] = [
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aiff", "aif", "alac",
+];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
     path.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+        .is_some_and(|e| list.contains(&e.as_str()))
+}
+
+pub fn is_video(path: &Path) -> bool {
+    has_extension(path, &VIDEO_EXTENSIONS)
+}
+
+pub fn is_audio(path: &Path) -> bool {
+    has_extension(path, &AUDIO_EXTENSIONS)
+}
+
+/// Anything this program will read: video or audio.
+pub fn is_media(path: &Path) -> bool {
+    is_video(path) || is_audio(path)
 }
 
 /// Our own previous output should not become an input.
@@ -31,11 +51,26 @@ fn looks_like_our_output(name: &str) -> bool {
 
 /// Every video in a folder, in natural filename order.
 pub fn video_files_in_folder(folder: &Path, exclude_leaf: Option<&str>) -> Vec<PathBuf> {
+    files_in_folder(folder, exclude_leaf, is_video)
+}
+
+/// Every video *and* audio file in a folder. What dropping a folder in means:
+/// the list holds whatever can be read, and the merge is the one that insists on
+/// a picture.
+pub fn media_files_in_folder(folder: &Path, exclude_leaf: Option<&str>) -> Vec<PathBuf> {
+    files_in_folder(folder, exclude_leaf, is_media)
+}
+
+fn files_in_folder(
+    folder: &Path,
+    exclude_leaf: Option<&str>,
+    accept: fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = match std::fs::read_dir(folder) {
         Ok(entries) => entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file() && is_video(p))
+            .filter(|p| p.is_file() && accept(p))
             .filter(|p| {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 !looks_like_our_output(&name)
@@ -144,9 +179,9 @@ pub fn expand(candidate: &str) -> Result<Vec<PathBuf>, String> {
     let path = Path::new(candidate);
 
     if path.is_dir() {
-        let files = video_files_in_folder(path, None);
+        let files = media_files_in_folder(path, None);
         if files.is_empty() {
-            return Err(format!("No videos in that folder: {candidate}"));
+            return Err(format!("No videos or audio in that folder: {candidate}"));
         }
         return Ok(files);
     }
@@ -233,9 +268,9 @@ pub fn spawn_probe<T: Send + 'static>(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if !is_video(&file) {
+            if !is_media(&file) {
                 rejected += 1;
-                send(AddEvent::Rejected { name, why: "not a supported video format".into() });
+                send(AddEvent::Rejected { name, why: "not a video or audio format".into() });
                 continue;
             }
             match probe::clip_info(&tools.ffprobe, &file) {
@@ -245,7 +280,10 @@ pub fn spawn_probe<T: Send + 'static>(
                 }
                 None => {
                     rejected += 1;
-                    send(AddEvent::Rejected { name, why: "could not be read as video".into() });
+                    send(AddEvent::Rejected {
+                        name,
+                        why: "has neither video nor audio in it".into(),
+                    });
                 }
             }
         }

@@ -12,6 +12,9 @@ use crate::proc;
 pub struct ClipInfo {
     pub path: PathBuf,
     pub name: String,
+    /// Whether there is a picture at all. False for an mp3 or an m4a, which are
+    /// perfectly good inputs for a conversion and no use at all to a merge.
+    pub has_video: bool,
     pub video_codec: String,
     pub width: u32,
     pub height: u32,
@@ -35,7 +38,27 @@ impl ClipInfo {
     }
 
     pub fn dimensions(&self) -> String {
+        if !self.has_video {
+            return crate::theme::glyph::NONE.to_string();
+        }
         format!("{}{}{}", self.width, crate::theme::glyph::TIMES, self.height)
+    }
+
+    /// The framerate column. A file with no picture has no framerate, and a "0"
+    /// there reads as a measurement that came out wrong.
+    pub fn fps_label(&self) -> String {
+        if !self.has_video {
+            return crate::theme::glyph::NONE.to_string();
+        }
+        crate::format::fps(self.fps)
+    }
+
+    /// Both codecs in one column, e.g. `h264·aac`, `h264·—` when silent, and
+    /// `—·mp3` for a file that is only sound.
+    pub fn codec_label(&self) -> String {
+        let video = if self.has_video { self.video_codec.as_str() } else { crate::theme::glyph::NONE };
+        let audio = if self.has_audio { self.audio_codec.as_str() } else { crate::theme::glyph::NONE };
+        format!("{video}{}{audio}", crate::theme::glyph::DOT)
     }
 }
 
@@ -87,8 +110,13 @@ fn parse_rational(text: &str) -> f64 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
-/// Reads one clip's format. Returns None for anything that is not readable
-/// video, which is how callers decide to skip a file.
+/// Reads one file's format. Returns None for anything with neither a video nor
+/// an audio stream in it, which is how callers decide to skip a file.
+///
+/// A file with sound and no picture comes back as a `ClipInfo` with `has_video`
+/// false and its video fields left at zero. That is not a clip a merge can use,
+/// and it is exactly what a conversion to another audio format needs - so the
+/// two callers that care check the flag rather than this returning None.
 pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
     let mut cmd = Command::new(ffprobe);
     cmd.args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", "--"])
@@ -99,11 +127,16 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
     }
 
     let data: ProbeOutput = serde_json::from_slice(&out.stdout).ok()?;
-    let video = data.streams.iter().find(|s| s.codec_type.as_deref() == Some("video"))?;
+    let video = data.streams.iter().find(|s| s.codec_type.as_deref() == Some("video"));
     let audio = data.streams.iter().find(|s| s.codec_type.as_deref() == Some("audio"));
+    // Neither stream means this is not media at all - a text file that someone
+    // renamed, or a download that stopped before anything arrived.
+    if video.is_none() && audio.is_none() {
+        return None;
+    }
 
-    let raw_fps = video.r_frame_rate.as_deref().map(parse_rational).unwrap_or(0.0);
-    let avg_fps = video.avg_frame_rate.as_deref().map(parse_rational).unwrap_or(0.0);
+    let raw_fps = video.and_then(|v| v.r_frame_rate.as_deref()).map(parse_rational).unwrap_or(0.0);
+    let avg_fps = video.and_then(|v| v.avg_frame_rate.as_deref()).map(parse_rational).unwrap_or(0.0);
 
     // r_frame_rate is the highest rate the stream could carry, not the rate it
     // runs at. A previously merged file often reports something silly like 375.
@@ -123,7 +156,7 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
     // itself as 1920x1080 plus rotate:90. Track it so a rotated clip is never
     // treated as format-identical to an unrotated one.
     let mut rotation = 0i32;
-    if let Some(list) = &video.side_data_list {
+    if let Some(list) = video.and_then(|v| v.side_data_list.as_ref()) {
         for sd in list {
             if let Some(r) = sd.rotation {
                 rotation = r.abs().round() as i32;
@@ -131,7 +164,7 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
         }
     }
     if rotation == 0
-        && let Some(tags) = &video.tags
+        && let Some(tags) = video.and_then(|v| v.tags.as_ref())
     {
         for (k, v) in tags {
             if k.eq_ignore_ascii_case("rotate")
@@ -143,8 +176,8 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
     }
     rotation = rotation.rem_euclid(360);
 
-    let mut width = video.width.unwrap_or(0);
-    let mut height = video.height.unwrap_or(0);
+    let mut width = video.and_then(|v| v.width).unwrap_or(0);
+    let mut height = video.and_then(|v| v.height).unwrap_or(0);
     if rotation == 90 || rotation == 270 {
         std::mem::swap(&mut width, &mut height);
     }
@@ -164,12 +197,15 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        video_codec: video.codec_name.clone().unwrap_or_default(),
+        has_video: video.is_some(),
+        video_codec: video.and_then(|v| v.codec_name.clone()).unwrap_or_default(),
         width,
         height,
-        pix_fmt: video.pix_fmt.clone().unwrap_or_default(),
-        fps: (effective_fps * 1000.0).round() / 1000.0,
-        frame_rate_raw: video.r_frame_rate.clone().unwrap_or_default(),
+        pix_fmt: video.and_then(|v| v.pix_fmt.clone()).unwrap_or_default(),
+        // A file with no picture has no framerate either, and the fallback of 30
+        // above would put an invented one on screen.
+        fps: if video.is_some() { (effective_fps * 1000.0).round() / 1000.0 } else { 0.0 },
+        frame_rate_raw: video.and_then(|v| v.r_frame_rate.clone()).unwrap_or_default(),
         rotation,
         has_audio: audio.is_some(),
         audio_codec: audio

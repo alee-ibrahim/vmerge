@@ -7,13 +7,14 @@
 
 use super::*;
 use crate::app::{AppEvent, Entry, FetchView, MergeView};
+use crate::convert;
 use crate::fetch::FetchEvent;
 use crate::ffmpeg::Tools;
 use crate::merge::{MergeEvent, Outcome};
 use crate::probe::ClipInfo;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
@@ -21,6 +22,7 @@ fn clip(name: &str, w: u32, h: u32, fps: f64, secs: f64) -> ClipInfo {
     ClipInfo {
         path: PathBuf::from(format!("C:/clips/{name}")),
         name: name.into(),
+        has_video: true,
         video_codec: "h264".into(),
         width: w,
         height: h,
@@ -34,6 +36,22 @@ fn clip(name: &str, w: u32, h: u32, fps: f64, secs: f64) -> ClipInfo {
         channels: 2,
         duration: secs,
         size_bytes: 1024 * 1024,
+    }
+}
+
+/// Sound with no picture: a legitimate thing to convert, and nothing a merge can
+/// use.
+fn soundtrack(name: &str, codec: &str, secs: f64) -> ClipInfo {
+    ClipInfo {
+        has_video: false,
+        video_codec: String::new(),
+        width: 0,
+        height: 0,
+        pix_fmt: String::new(),
+        fps: 0.0,
+        frame_rate_raw: String::new(),
+        audio_codec: codec.into(),
+        ..clip(name, 0, 0, 0.0, secs)
     }
 }
 
@@ -440,7 +458,7 @@ fn merge_screen_shows_progress_per_clip() {
         clip("two.mp4", 1280, 720, 25.0, 10.0),
     ]);
     app.screen =
-        Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
+        Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
 
     app.handle_event(AppEvent::Merge(MergeEvent::Plan("Common format: 1920x1080".into())));
     app.handle_event(AppEvent::Merge(MergeEvent::SegmentStart {
@@ -477,7 +495,7 @@ fn merge_screen_shows_progress_per_clip() {
 fn a_failed_clip_is_visible_on_the_merge_screen() {
     let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 10.0)]);
     app.screen =
-        Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
+        Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
     app.handle_event(AppEvent::Merge(MergeEvent::SegmentEnd {
         index: 0,
         step: Step::Convert,
@@ -487,10 +505,172 @@ fn a_failed_clip_is_visible_on_the_merge_screen() {
     assert!(render(&app, 100, 30).contains("failed"));
 }
 
+// ------------------------------------------------------------------- convert
+
+#[test]
+fn the_convert_picker_lists_the_formats_and_says_what_it_will_do() {
+    let (mut app, _rx) = app_with(vec![
+        clip("one.mp4", 1920, 1080, 30.0, 10.0),
+        clip("two.mov", 1280, 720, 25.0, 10.0),
+    ]);
+    app.menu_convert();
+
+    let screen = render(&app, 100, 34);
+    assert!(screen.contains("CONVERT 2 FILE(S) TO"), "got:\n{screen}");
+    // Video and audio both, because "any format" is the point.
+    for format in ["MKV", "WEBM", "GIF", "MP3", "FLAC"] {
+        assert!(screen.contains(format), "expected {format}:\n{screen}");
+    }
+    // The two things worth knowing before pressing it: where the files go, and
+    // that this is not a merge.
+    assert!(screen.contains("beside the original"), "got:\n{screen}");
+    assert!(screen.contains("Nothing is merged"), "got:\n{screen}");
+}
+
+/// Marking is how a subset gets picked out everywhere else in the program, so it
+/// has to mean the same thing here - and the picker has to say so before the job
+/// starts rather than after.
+#[test]
+fn marking_narrows_what_a_conversion_touches() {
+    let (mut app, _rx) = app_with(vec![
+        clip("one.mp4", 1920, 1080, 30.0, 10.0),
+        clip("two.mov", 1280, 720, 25.0, 10.0),
+        clip("three.mkv", 1280, 720, 25.0, 10.0),
+    ]);
+    app.clips[1].marked = true;
+
+    app.menu_convert();
+    let screen = render(&app, 100, 34);
+    assert!(screen.contains("CONVERT 1 MARKED FILE(S) TO"), "got:\n{screen}");
+}
+
+#[test]
+fn the_convert_screen_counts_files_and_names_the_format() {
+    let clips =
+        vec![clip("one.mp4", 1920, 1080, 30.0, 10.0), clip("two.mov", 1280, 720, 25.0, 10.0)];
+    let (mut app, _rx) = app_with(clips.clone());
+    app.screen = Screen::Converting(MergeView::converting(convert::Target::Mkv, &clips));
+
+    app.handle_event(AppEvent::Merge(MergeEvent::Plan("2 files to MKV".into())));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentEnd {
+        index: 0,
+        step: Step::Copy,
+        ok: true,
+        elapsed: 0.3,
+    }));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentStart {
+        index: 1,
+        name: "two.mov".into(),
+        step: Step::Convert,
+        duration: 10.0,
+    }));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentProgress { index: 1, done: 5.0 }));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("1/2 files"), "files, not clips - nothing is joined:\n{screen}");
+    assert!(screen.contains("as MKV"), "got:\n{screen}");
+    assert!(screen.contains("CONVERTING"), "the phase is not 'preparing clips':\n{screen}");
+    assert!(screen.contains("stop converting"), "got:\n{screen}");
+    // One file of two done plus half of the second, and no join to hold room
+    // for: 75%, where the same progress on the merge screen reads 64%.
+    assert!(screen.contains("75%"), "expected overall progress:\n{screen}");
+}
+
+/// A merge keeps the last slice of the bar for the join. A conversion has no
+/// join, so a finished batch must read 100% rather than sitting at 85%.
+#[test]
+fn a_conversion_bar_is_not_held_back_for_a_join_that_never_comes() {
+    let clips = vec![clip("one.mp4", 1920, 1080, 30.0, 10.0)];
+    let (mut app, _rx) = app_with(clips.clone());
+
+    fn finish(app: &mut App) {
+        app.handle_event(AppEvent::Merge(MergeEvent::SegmentEnd {
+            index: 0,
+            step: Step::Copy,
+            ok: true,
+            elapsed: 1.0,
+        }));
+    }
+
+    app.screen = Screen::Converting(MergeView::converting(convert::Target::Mp3, &clips));
+    finish(&mut app);
+    let Screen::Converting(view) = &app.screen else { panic!("expected the convert screen") };
+    assert!((view.overall() - 1.0).abs() < 1e-9, "got {}", view.overall());
+
+    app.screen = Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
+    finish(&mut app);
+    let Screen::Merging(view) = &app.screen else { panic!("expected the merge screen") };
+    assert!((view.overall() - 0.85).abs() < 1e-9, "got {}", view.overall());
+}
+
+#[test]
+fn the_report_describes_a_batch_by_the_count_and_not_by_one_file() {
+    let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 10.0)]);
+    let mut done = outcome(true);
+    done.output = PathBuf::from("C:/clips/clip1.mkv");
+    done.outputs = (1..=10).map(|n| PathBuf::from(format!("C:/clips/clip{n}.mkv"))).collect();
+    app.screen = Screen::Converted(Box::new(done));
+
+    let screen = render(&app, 100, 34);
+    assert!(screen.contains("10 written"), "got:\n{screen}");
+    assert!(screen.contains("clips"), "where they went:\n{screen}");
+    assert!(screen.contains("clip1.mkv"), "got:\n{screen}");
+    // Eight names and then a count: a report, not a directory listing.
+    assert!(!screen.contains("clip9.mkv"), "got:\n{screen}");
+    assert!(screen.contains("and 2 more"), "got:\n{screen}");
+}
+
+/// A finished conversion must not renumber the merge output: it never went near
+/// merged.mp4, and the name may be one set for a merge still to come.
+#[test]
+fn a_conversion_leaves_the_merge_output_name_alone() {
+    let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 10.0)]);
+    app.output_name = "holiday.mp4".into();
+    app.screen = Screen::Converted(Box::new(outcome(true)));
+
+    app.dismiss_result();
+    assert_eq!(app.output_name, "holiday.mp4");
+    assert!(matches!(app.screen, Screen::Browse));
+}
+
+#[test]
+fn stopping_a_conversion_says_the_finished_files_are_kept() {
+    let (mut app, _rx) = app_with(vec![clip("one.mp4", 1920, 1080, 30.0, 10.0)]);
+    app.overlay = Overlay::Confirm(Confirm::CancelConvert);
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("STOP CONVERTING?"), "got:\n{screen}");
+    assert!(screen.contains("already converted are kept"), "got:\n{screen}");
+}
+
+/// An mp3 in the list is a conversion waiting to happen. It is also the one thing
+/// a merge cannot use, and the list has to show both facts.
+#[test]
+fn a_file_with_no_picture_reads_as_sound_and_is_refused_by_the_merge() {
+    let (mut app, _rx) = app_with(vec![
+        clip("one.mp4", 1920, 1080, 30.0, 10.0),
+        soundtrack("song.mp3", "mp3", 200.0),
+    ]);
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("song.mp3"), "got:\n{screen}");
+    assert!(screen.contains("\u{2014}\u{00b7}mp3"), "no codec and no zero:\n{screen}");
+    assert!(!screen.contains("0\u{00d7}0"), "a measurement that never happened:\n{screen}");
+
+    app.request_merge();
+    let (message, kind) = app.status.clone().expect("a refusal");
+    assert!(message.contains("song.mp3"), "got {message}");
+    assert!(message.contains("no picture"), "got {message}");
+    assert_eq!(kind, Kind::Bad);
+    // And it says which key does work on it.
+    assert!(message.contains('V'), "got {message}");
+}
+
 fn outcome(ok: bool) -> Outcome {
     Outcome {
         ok,
         output: PathBuf::from("C:/clips/merged.mp4"),
+        outputs: if ok { vec![PathBuf::from("C:/clips/merged.mp4")] } else { Vec::new() },
         size: 5 * 1024 * 1024,
         out_duration: if ok { 65.0 } else { 0.0 },
         out_format: if ok { Some((1920, 1080, 29.97)) } else { None },
@@ -553,7 +733,7 @@ fn awkward_terminal_sizes_do_not_panic() {
         app.close_overlay();
 
         app.screen =
-            Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
+            Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
         render(&app, w, h);
 
         app.screen = Screen::Result(Box::new(outcome(true)));
@@ -983,7 +1163,7 @@ fn a_retry_pass_starts_the_rows_over() {
         clip("two.mp4", 1920, 1080, 30.0, 10.0),
     ]);
     app.screen =
-        Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
+        Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
 
     // Pass one gets through both clips, then the join fails.
     for index in 0..2 {
@@ -1056,7 +1236,7 @@ fn dump_screens() {
 {}", render(&app, 96, 26));
     app.close_overlay();
 
-    app.screen = Screen::Merging(MergeView::new(PathBuf::from("C:/clips/merged.mp4"), &app.clips));
+    app.screen = Screen::Merging(MergeView::new(Path::new("C:/clips/merged.mp4"), &app.clips));
     app.handle_event(AppEvent::Merge(MergeEvent::Plan(
         "Common format: 1920×1080 @ 30 fps, H.264 + AAC stereo 48000 Hz".into(),
     )));
@@ -1091,6 +1271,49 @@ fn dump_screens() {
     app.screen = Screen::Result(Box::new(outcome(true)));
     println!("
 === result ===
+{}", render(&app, 96, 26));
+
+    app.screen = Screen::Browse;
+    app.menu_convert();
+    println!("
+=== format picker ===
+{}", render(&app, 96, 30));
+    app.close_overlay();
+
+    let clips: Vec<ClipInfo> = app.clips.iter().map(|e| e.clip.clone()).collect();
+    app.screen = Screen::Converting(MergeView::converting(convert::Target::Mkv, &clips));
+    app.handle_event(AppEvent::Merge(MergeEvent::Plan(
+        "4 files to MKV, each written beside the original.".into(),
+    )));
+    app.handle_event(AppEvent::Merge(MergeEvent::Plan(
+        "3 are remuxed as they are; 1 is re-encoded with CPU (libx264), quality high.".into(),
+    )));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentEnd {
+        index: 0,
+        step: Step::Copy,
+        ok: true,
+        elapsed: 0.3,
+    }));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentStart {
+        index: 1,
+        name: "beach clip 2.mov".into(),
+        step: Step::Copy,
+        duration: 64.0,
+    }));
+    app.handle_event(AppEvent::Merge(MergeEvent::SegmentProgress { index: 1, done: 22.0 }));
+    println!("
+=== converting ===
+{}", render(&app, 96, 26));
+
+    let mut batch = outcome(true);
+    batch.output = PathBuf::from("C:/clips/intro.mkv");
+    batch.outputs = ["intro", "beach clip 2", "drone_10", "outro"]
+        .iter()
+        .map(|n| PathBuf::from(format!("C:/clips/{n}.mkv")))
+        .collect();
+    app.screen = Screen::Converted(Box::new(batch));
+    println!("
+=== converted ===
 {}", render(&app, 96, 26));
 
     app.screen = Screen::Browse;

@@ -3,7 +3,8 @@
 Joins video clips into one `.mp4` with a real terminal UI: arrow-key selection,
 in-place reordering, and live progress bars. It will also
 [fetch a video from a link](#downloading-a-video) if you have not got the clip
-yet.
+yet, and [convert files between formats](#converting-between-formats) - any of
+seventeen video and twelve audio formats in, any of twelve out.
 
 Build:
 
@@ -128,6 +129,7 @@ order you dropped them.
 | `del` | remove marked clips, or the selected one |
 | `a` | add clips (type or paste a path) |
 | `u` | **download a video** from a link |
+| `v` | **convert to another format** |
 | `c` | clear the list |
 | `n` | sort by filename (1, 2, 10 — not 1, 10, 2) |
 | `m` | release/recapture the mouse |
@@ -138,7 +140,7 @@ order you dropped them.
 | `t` | target size and framerate |
 | `e` | encoder (auto ⇄ cpu) |
 | `r` | force a re-encode of every clip |
-| `esc` | clear marks, close a dialog, or cancel a running merge or download |
+| `esc` | clear marks, close a dialog, or stop a running merge, conversion or download |
 | `x` | exit |
 
 ### Mouse
@@ -339,6 +341,68 @@ usable, for a list that was wrong anyway.
 Playlists are not supported: a link that carries one alongside a video gets the
 video, and a bare playlist link gets its first entry.
 
+### Converting between formats
+
+`v` converts instead of joining. It asks which format, then writes every file in
+the list out again in that format, beside the original, at the same size and
+length — one file in, one file out. Nothing is merged, and nothing is replaced:
+`clip.mp4` becomes `clip.mkv`, and if that name is taken it becomes `clip_2.mkv`.
+Mark some clips first and only those are converted; mark none and it takes the
+lot. `--convert-to <FORMAT>` is the same job without the screen.
+
+```
+MERGE-VIDEOS.exe --convert-to mkv D:\clips\holiday.mp4
+MERGE-VIDEOS.exe --convert-to mp3 --folder D:\recordings
+```
+
+| Video | |
+| --- | --- |
+| `mp4` | H.264 + AAC — plays anywhere |
+| `mkv` | Matroska; takes any codec, so usually a remux |
+| `mov` | QuickTime, for Premiere and Final Cut |
+| `webm` | VP9 + Opus — small, for the web, slow to encode |
+| `avi` | MPEG-4 + MP3, for software old enough to need it |
+| `ts` | MPEG transport stream — what a merge uses inside |
+| `gif` | silent animation, 12 fps and 640 wide |
+
+| Audio only | |
+| --- | --- |
+| `mp3` | plays on anything |
+| `m4a` | AAC; smaller than MP3 at the same quality |
+| `wav` | uncompressed 16-bit PCM, for editing |
+| `flac` | lossless, about half the size of WAV |
+| `opus` | the smallest of these at one quality |
+
+**A container swap is a remux, not a re-encode.** An H.264 + AAC mp4 becoming an
+mkv, a mov or a ts does not go near an encoder: the streams are written into the
+new wrapper untouched, which takes seconds and loses nothing. The same is true of
+pulling the sound out of a video that is already AAC into an `.m4a`. Only a format
+that cannot carry what is there re-encodes — mp4 to webm, anything to gif, AAC to
+mp3 — and the screen says which files those are before it starts. `r` (force
+re-encode) overrides all of it when a re-encode is what you actually want.
+
+AVI is the deliberate exception. It will hold H.264 and the result plays in VLC,
+but the only reason to ask for an AVI is software that cannot read anything
+newer, so H.264 into AVI re-encodes to MPEG-4 rather than copying and calling it
+converted.
+
+Nothing is resized or re-timed: the picture comes out the size it went in, with
+every frame still there. GIF is the one exception — it is a still-image format
+pressed into service as video, so 12 fps at 640 wide is the difference between a
+file you can post and one you cannot — and the picker says so before you pick it.
+
+**Audio files are inputs too.** `mp3 m4a aac wav flac ogg oga opus wma aiff aif
+alac` can be added to the list and converted like anything else, which is how
+mp3 → wav works. They cannot be merged: a merge needs a picture, so one in the
+list is refused by name rather than failing halfway through, and the list shows
+it as `—·mp3` with no size and no framerate rather than inventing `0×0` at 0 fps.
+
+A file that cannot become the format asked for — an mp3 to mp4, a silent clip to
+mp3 — is counted out in the plan line up front and then left out with a note.
+One bad file does not end the batch: forty clips with one truncated download in
+them come out as thirty-nine conversions and a note. Stopping a batch with `esc`
+keeps every file already finished and removes only the one in progress.
+
 ### Updating itself
 
 Every start checks whether a newer release exists, and installs it if one does.
@@ -413,6 +477,7 @@ MERGE-VIDEOS.exe --no-tui a.mp4 b.mp4 --quality small --encoder cpu
 | `--quality` | `visually-lossless` \| `high` \| `medium` \| `small` |
 | `--encoder` | `auto` \| `cpu` \| `nvenc` \| `qsv` \| `amf` |
 | `--force-reencode` | re-encode even when clips already match |
+| `--convert-to <format>` | convert the files given (or all of `--folder`) and stop |
 | `--download <url>` | download that one video and stop; nothing is merged |
 | `--download-quality` | `best` \| `2160p` \| `1080p` \| `720p` \| `480p` \| `audio` |
 | `--skip-ffmpeg-download` | fail instead of downloading ffmpeg |
@@ -486,6 +551,26 @@ knowledge lives:
   `rotate:90`, and must not be treated as identical to an unrotated clip.
 - **Silent clips get a generated audio track**, or the join desyncs.
 
+### And what a conversion does instead
+
+- **The wrapper changes on its own when it can.** Every target format carries a
+  list of the codecs it will take as they are; a file whose streams are on the
+  list is remuxed, and only one that is not goes through an encoder. Matroska
+  takes everything, which is why "convert to mkv" is almost always seconds.
+- **Each encoder gets its own quality scale.** H.264's CRF runs 0–51, VP9's
+  0–63, MPEG-4 wants a 1–31 quantiser, and MP3 wants LAME's inverted 0–9. One
+  `--quality` name maps onto all of them rather than one number being handed to
+  encoders that read it differently.
+- **The GPU is only asked about H.264.** VP9, MPEG-4, GIF and every audio format
+  have one encoder each, so the encoder probe — which costs a moment, because it
+  test-encodes — is skipped entirely for them.
+- **Odd sizes are evened and 10-bit is flattened.** An odd width is legal in a
+  source and rejected by every encoder here, and a 10-bit source encoded as
+  H.264 High 10 plays on very little. Neither is a resize.
+- **A GIF gets two passes over one decode** — a palette built from those frames,
+  then applied to them. One pass means 256 colours chosen without ever looking at
+  the clip, which is the difference between a gradient and a poster.
+
 ### Three strategies
 
 `Invoke-MergeAll` in the PowerShell version called `Invoke-CopyMerge`,
@@ -535,9 +620,11 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-65 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
-what blocks the fast path) are covered directly, and every screen and overlay is
-rendered into a `TestBackend` and read back — including at terminal sizes down
+126 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+what blocks the fast path) are covered directly, as are the conversion rules
+(which container takes which codec as it is, which format needs which encoder,
+that mp4 to mp4 never hands ffmpeg the file it is reading), and every screen and
+overlay is rendered into a `TestBackend` and read back — including at terminal sizes down
 to 1x1, which is what catches a layout that would panic on a resize.
 
 The self-updater is tested where the decisions are, not where the network is:
