@@ -215,6 +215,7 @@ fn the_download_screen_reports_what_is_arriving() {
         total: Some(20 * 1024 * 1024),
         rate: 2.0 * 1024.0 * 1024.0,
         eta: Some(8.0),
+        fragments: None,
     }));
 
     let screen = render(&app, 100, 30);
@@ -240,6 +241,7 @@ fn a_download_of_unknown_size_draws_no_bar() {
         total: None,
         rate: 512.0 * 1024.0,
         eta: None,
+        fragments: None,
     }));
 
     let screen = render(&app, 100, 30);
@@ -262,6 +264,7 @@ fn a_second_stream_restarts_the_bar_and_says_which_one_it_is() {
         total: Some(100),
         rate: 10.0,
         eta: None,
+        fragments: None,
     }));
     assert!(render(&app, 100, 30).contains("100%"));
 
@@ -304,27 +307,28 @@ fn a_live_broadcast_says_it_is_live_and_that_it_runs_until_stopped() {
         "This is live. It will keep recording until the broadcast ends or you stop it.".into(),
     )));
     app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Recording)));
-    app.handle_event(AppEvent::Fetch(FetchEvent::Captured(754.0)));
     app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
         done: 96 * 1024 * 1024,
         total: None,
         rate: 130.0 * 1024.0,
         eta: None,
+        fragments: Some((322, 1877)),
     }));
 
     let screen = render(&app, 100, 30);
     assert!(screen.contains("26th Sitting"), "got:\n{screen}");
     assert!(screen.contains("RECORDING  LIVE"), "got:\n{screen}");
     assert!(screen.contains("This is live"), "the note explains itself:\n{screen}");
-    // The timecode is the real measure of a recording, and the sweep beside it
-    // is what shows the capture is still running.
-    assert!(screen.contains("12:34"), "expected the captured length:\n{screen}");
-    assert!(screen.contains('█'), "expected the moving bar:\n{screen}");
+    // 322 of 1877 pieces. A real fraction of what has been broadcast so far,
+    // which is the only thing a live download can honestly be measured against -
+    // and it has to say that is what it is, or 17% reads as "nearly nothing yet"
+    // rather than "seventeen minutes of the first hundred".
+    assert!(screen.contains("17%"), "expected a measured position:\n{screen}");
+    assert!(screen.contains("of the broadcast so far"), "got:\n{screen}");
+    assert!(screen.contains('█'), "expected a drawn bar:\n{screen}");
     assert!(screen.contains("captured"), "got:\n{screen}");
     assert!(screen.contains("96.0 MB"), "got:\n{screen}");
-    // Never a percentage and never an estimate: a broadcast has no end to
-    // measure against, and inventing one would be a lie the bar tells.
-    assert!(!screen.contains('%'), "a live capture has no percentage:\n{screen}");
+    // Never an estimate: there is no telling when a sitting will end.
     assert!(!screen.contains("estimating"), "got:\n{screen}");
     assert!(screen.contains("when you stop it"), "got:\n{screen}");
     // Stopping a recording keeps it, so esc cannot be labelled as throwing it
@@ -545,6 +549,7 @@ fn awkward_terminal_sizes_do_not_panic() {
             total: Some(4096),
             rate: 512.0,
             eta: Some(6.0),
+            fragments: None,
         }));
         render(&app, w, h);
 
@@ -1097,6 +1102,7 @@ fn dump_screens() {
         total: Some(29 * 1024 * 1024),
         rate: 10.7 * 1024.0 * 1024.0,
         eta: Some(1.0),
+        fragments: None,
     }));
     println!("
 === downloading ===

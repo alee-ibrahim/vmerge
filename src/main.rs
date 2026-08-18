@@ -407,17 +407,18 @@ fn run_tui(
         app.output_name = name.to_string_lossy().into_owned();
     }
 
+    // Files dropped onto the program start the list, in the order they were
+    // dropped. Nothing else does: the folder is not read on the way in.
+    //
+    // It used to be, on the reasoning that "the clips are in this folder" is the
+    // common case and preloading saves typing. What it actually does is present
+    // a list nobody asked for - a folder of unrelated videos, or the output of
+    // yesterday's merge - and the first thing to do with it is clear it. Worse,
+    // it makes the program's opening move a scan of every video in the folder,
+    // which on a folder of finished recordings is a long wait for a list that
+    // was wrong anyway.
     if !files.is_empty() {
-        // Files were dropped onto the program: start with exactly those, in the
-        // order they were dropped.
         app.add_paths(files.iter().map(|f| f.display().to_string()).collect());
-    } else {
-        // Otherwise preload whatever is already sitting in the folder - the
-        // common case is "the clips are in this folder", and it saves any typing.
-        let preload = collect::video_files_in_folder(&root, None);
-        if !preload.is_empty() {
-            app.add_paths(preload.iter().map(|f| f.display().to_string()).collect());
-        }
     }
 
     let mut terminal = ratatui::init();

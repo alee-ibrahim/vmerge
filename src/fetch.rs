@@ -27,20 +27,24 @@
 //! finish. yt-dlp hands live streams to ffmpeg and then reports nothing at all
 //! about them - no progress hook of its own fires, which is why this used to sit
 //! at "got 0 KB" for as long as anyone left it there. So a link is asked what it
-//! is *before* anything is fetched, and a live one takes a different route: this
-//! program runs ffmpeg itself, and esc means "that is enough, keep it" rather
-//! than "throw it away".
+//! is *before* anything is fetched, and a live one is fetched differently:
+//! `--live-from-start`, which asks yt-dlp for the broadcast from its beginning
+//! rather than from this moment.
 //!
-//! What makes that safe is the container, not politeness. ffmpeg will close a
-//! file tidily if it is sent a `q`, but only when its stdin is a console - given
-//! a pipe it never reads the keystroke, which was measured here rather than
-//! assumed: a `q` sent to a piped stdin was still being ignored a minute later.
-//! So a recording is stopped by ending the process, and it is written to an
-//! MPEG-TS stream precisely because that survives being ended. Every packet is
-//! flushed as it is written, so what is on disk is playable at every instant and
-//! stopping costs at most the packet in flight.
+//! That one flag settles three things at once. It is what makes a sitting
+//! already an hour old arrive as an hour of video instead of the tail end of
+//! one. It puts the download back on yt-dlp's own fragment downloader, which
+//! reports progress properly - the silence was never a live stream being
+//! unreportable, only ffmpeg being handed the job and saying nothing about it.
+//! And because the work is counted in fragments, and the site says how many
+//! there are, a live download has a real position to show rather than a
+//! spinner: it is a measured fraction of what has been broadcast so far, which
+//! creeps as the broadcast goes on and is honest about never quite arriving.
+//!
+//! Stopping one keeps it. yt-dlp is ended and the part-finished streams it
+//! leaves behind are joined into a playable file, so esc means "that is enough"
+//! rather than "throw away the hour you just waited for".
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -84,17 +88,10 @@ const PATH_RECORD: &str = "finished-path.txt";
 /// fresh ones.
 const ATTEMPTS: u32 = 3;
 
-/// What a live recording is written to before it is put into its final
-/// container.
+/// The suffix yt-dlp gives a stream it has not finished writing.
 ///
-/// MPEG-TS rather than mp4, and not for tradition. An mp4 only becomes readable
-/// when its index is written at the very end, so a recording that ends in any
-/// way other than politely - a crash, a power cut, a task manager - would be a
-/// file of the right size that nothing can open. A transport stream has no index
-/// to miss: it is playable at every instant, and cutting it anywhere leaves the
-/// part before the cut intact. The remux afterwards costs a copy of the bytes
-/// and no quality at all.
-const RECORDING_NAME: &str = "recording.ts";
+/// What a stopped live download leaves behind, and what is salvaged from it.
+const PART: &str = ".part";
 
 
 /// Which stream to take. Not a bitrate or a codec: the point of a picker in a
@@ -205,11 +202,15 @@ pub enum FetchEvent {
     /// A separate stream has started. Video and audio arrive one after the other
     /// when the best copy of each is in a different file, so the bar restarts.
     Stream(u32),
-    Progress { done: u64, total: Option<u64>, rate: f64, eta: Option<f64> },
-    /// How much of a live broadcast is in the file so far, in seconds of
-    /// running time. The only honest measure of a recording's progress: there
-    /// is no total to be a fraction of, but "37 minutes captured" is a fact.
-    Captured(f64),
+    Progress {
+        done: u64,
+        total: Option<u64>,
+        rate: f64,
+        eta: Option<f64>,
+        /// Pieces done and pieces there are, when the stream comes in pieces.
+        /// What a live broadcast is measured by, having no byte total.
+        fragments: Option<(u64, u64)>,
+    },
     Finished(Box<Outcome>),
 }
 
@@ -269,7 +270,7 @@ impl Reporter for SetupProgress<'_> {
             }
             _ => None,
         };
-        (self.emit)(FetchEvent::Progress { done: received, total, rate, eta });
+        (self.emit)(FetchEvent::Progress { done: received, total, rate, eta, fragments: None });
     }
 
     fn finished(&mut self) {}
@@ -338,7 +339,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(FetchEvent)) -> 
     proc::set_hidden(&temp_dir);
 
     emit(FetchEvent::Stage(Stage::Asking));
-    emit(FetchEvent::Progress { done: 0, total: None, rate: 0.0, eta: None });
+    emit(FetchEvent::Progress { done: 0, total: None, rate: 0.0, eta: None, fragments: None });
 
     let mut live = Live::No;
     let mut result = attempt(&tool.path, job, &temp_dir, cancel, emit, &mut live);
@@ -420,22 +421,22 @@ fn attempt(
         emit(FetchEvent::Title(title.clone()));
     }
 
-    match source.live {
-        Live::Upcoming => Err("That broadcast has not started yet. There is nothing to \
-                               record until it does."
-            .into()),
-        Live::Now => {
-            emit(FetchEvent::Note(
-                "This is live. It will keep recording until the broadcast ends or you stop it."
-                    .into(),
-            ));
-            record(job, &source, temp_dir, cancel, emit)
-        }
-        Live::No => {
-            emit(FetchEvent::Stage(Stage::Downloading));
-            download(ytdlp, job, temp_dir, cancel, source.title.as_deref(), emit)
-        }
+    if source.live == Live::Upcoming {
+        return Err("That broadcast has not started yet. There is nothing to record \
+                    until it does."
+            .into());
     }
+
+    let live = source.live == Live::Now;
+    if live {
+        emit(FetchEvent::Note(
+            "This is live. It is being taken from the start of the broadcast, and keeps \
+             recording until that ends or you stop it."
+                .into(),
+        ));
+    }
+    emit(FetchEvent::Stage(if live { Stage::Recording } else { Stage::Downloading }));
+    download(ytdlp, job, temp_dir, cancel, live, source.title.as_deref(), emit)
 }
 
 /// How streams are ranked once the format filter has had its say.
@@ -482,8 +483,20 @@ fn selection_args(job: &Job) -> Vec<String> {
 
 /// The arguments, kept apart from the running so they can be checked without a
 /// network.
-fn args(job: &Job, temp_dir: &Path, ffmpeg_dir: Option<&Path>) -> Vec<String> {
+fn args(job: &Job, temp_dir: &Path, ffmpeg_dir: Option<&Path>, live: bool) -> Vec<String> {
     let mut args = selection_args(job);
+
+    if live {
+        // From the beginning of the broadcast rather than from this moment.
+        //
+        // Someone opening this an hour into a sitting wants the hour, not the
+        // tail of it - and without the flag that hour is simply gone, because
+        // there is no going back for it once the broadcast ends. It also takes
+        // the download off ffmpeg and back onto yt-dlp's own fragment
+        // downloader, which is the only one of the two that reports progress.
+        args.push("--live-from-start".into());
+    }
+
     args.extend([
         // --print implies --simulate, which would download nothing at all.
         "--no-simulate".into(),
@@ -522,10 +535,15 @@ fn args(job: &Job, temp_dir: &Path, ffmpeg_dir: Option<&Path>) -> Vec<String> {
 
     args.extend([
         "--progress-template".to_string(),
+        // The two fragment fields are what a live download is measured by. It
+        // has no byte total - nobody knows how big a broadcast still running
+        // will be - but the site does say how many pieces it is in so far, and
+        // that is a real fraction rather than a guess.
         format!(
             "download:{PROGRESS_TAG} %(progress.status)s %(progress.downloaded_bytes)s \
              %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s \
-             %(progress.eta)s %(info.title)s"
+             %(progress.eta)s %(progress.fragment_index)s %(progress.fragment_count)s \
+             %(info.title)s"
         ),
         "--print-to-file".into(),
         "after_move:%(filepath)s".into(),
@@ -552,23 +570,11 @@ pub enum Live {
     Upcoming,
 }
 
-/// One stream ffmpeg is pointed at, with the headers the site expects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stream {
-    url: String,
-    headers: Vec<(String, String)>,
-}
-
 /// What one extraction pass says about a link, before anything is fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Source {
     title: Option<String>,
     live: Live,
-    /// Where the chosen streams actually are. Two of them when the best video
-    /// and the best audio live in separate files, which ffmpeg then reads side
-    /// by side. Only used for a recording; a finished video is left to yt-dlp,
-    /// which does the whole job better than a bare URL would.
-    streams: Vec<Stream>,
 }
 
 /// The handful of fields wanted out of yt-dlp's `-j` dump, which is otherwise
@@ -583,36 +589,6 @@ struct Info {
     /// not caught up with `live_status` is not silently treated as finished.
     #[serde(default)]
     is_live: Option<bool>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    http_headers: Option<BTreeMap<String, String>>,
-    /// Present when the choice was "best video plus best audio" and those turned
-    /// out to be two different files.
-    #[serde(default)]
-    requested_formats: Option<Vec<InfoFormat>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InfoFormat {
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    http_headers: Option<BTreeMap<String, String>>,
-}
-
-/// The headers ffmpeg should send, out of the ones yt-dlp worked out.
-///
-/// `Accept-Encoding` is dropped on purpose: yt-dlp asks for an identity encoding
-/// through its own machinery, and ffmpeg's HTTP client does not undo compression
-/// it did not ask for. Passing one on can turn a perfectly good stream into a
-/// file of gzip.
-fn headers_from(map: Option<&BTreeMap<String, String>>) -> Vec<(String, String)> {
-    map.into_iter()
-        .flatten()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("Accept-Encoding"))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
 }
 
 /// Reads what yt-dlp said about a link. Kept apart from running it so every rule
@@ -639,28 +615,7 @@ fn read_info(json: &str) -> Result<Source, String> {
         None => Live::No,
     };
 
-    let streams = match &info.requested_formats {
-        Some(formats) => formats
-            .iter()
-            .filter_map(|f| {
-                Some(Stream {
-                    url: f.url.clone()?,
-                    headers: headers_from(f.http_headers.as_ref()),
-                })
-            })
-            .collect(),
-        None => info
-            .url
-            .clone()
-            .map(|url| vec![Stream { url, headers: headers_from(info.http_headers.as_ref()) }])
-            .unwrap_or_default(),
-    };
-
-    Ok(Source {
-        title: info.title.filter(|t| !t.trim().is_empty()),
-        live,
-        streams,
-    })
+    Ok(Source { title: info.title.filter(|t| !t.trim().is_empty()), live })
 }
 
 /// Asks a link what it is, without fetching any of it.
@@ -714,299 +669,6 @@ fn ask(ytdlp: &Path, job: &Job, cancel: &AtomicBool) -> Result<Source, String> {
         });
     }
     read_info(&String::from_utf8_lossy(&stdout))
-}
-
-// ------------------------------------------------------------ recording live
-
-/// A title turned into something Windows will accept as a filename.
-///
-/// The same job `--windows-filenames` does for the download path, done here
-/// because the recording path names its own output. The reserved characters
-/// become underscores rather than vanishing, so two titles that differ only in
-/// punctuation do not collapse into one name.
-fn file_stem_for(title: &str) -> String {
-    let mut stem = String::with_capacity(title.len());
-    for c in title.chars() {
-        match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => stem.push('_'),
-            c if (c as u32) < 0x20 => stem.push('_'),
-            c => stem.push(c),
-        }
-    }
-    // Windows silently drops these from the end of a name, so a file would be
-    // written under one name and then not be found under it.
-    let stem = stem.trim().trim_end_matches('.').trim();
-
-    // Long titles make paths nothing can open. The same 120 bytes the download
-    // path asks for, cut on a character boundary so the name stays valid text.
-    let mut cut = stem.len().min(120);
-    while cut > 0 && !stem.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let stem = stem[..cut].trim_end();
-    if stem.is_empty() { "recording".to_string() } else { stem.to_string() }
-}
-
-/// A path in `folder` that no file is using yet.
-///
-/// A sitting recorded twice in one day would otherwise overwrite the first
-/// attempt, and the first attempt is the one with the beginning of it.
-fn free_path(folder: &Path, stem: &str, extension: &str) -> PathBuf {
-    let first = folder.join(format!("{stem}.{extension}"));
-    if !first.exists() {
-        return first;
-    }
-    for n in 2..1000 {
-        let candidate = folder.join(format!("{stem} ({n}).{extension}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    first
-}
-
-/// ffmpeg's `-headers` argument: one header per line, CRLF separated, the way
-/// the wire wants them.
-fn header_argument(headers: &[(String, String)]) -> String {
-    headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect()
-}
-
-/// What ffmpeg is told in order to capture a broadcast as it happens.
-///
-/// Every stream is copied rather than encoded. A live capture that cannot keep
-/// up is a live capture that loses the end of the sitting, and re-encoding 1080p
-/// in real time is exactly how that happens. `-map` is spelled out because the
-/// two-file case has the picture in one input and the sound in the other; the
-/// trailing `?` on the single-input case is what lets an audio-only recording
-/// ask for a video track that is not there without ffmpeg calling it an error.
-fn record_args(streams: &[Stream], output: &Path) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-    for stream in streams {
-        let headers = header_argument(&stream.headers);
-        if !headers.is_empty() {
-            args.extend(["-headers".to_string(), headers]);
-        }
-        // A sitting runs for hours and a home connection does not stay up for
-        // all of them. Without this, one dropped socket ends the recording;
-        // with it, ffmpeg picks the broadcast back up where it left off.
-        args.extend([
-            "-reconnect".to_string(),
-            "1".into(),
-            "-reconnect_streamed".into(),
-            "1".into(),
-            "-reconnect_delay_max".into(),
-            "30".into(),
-            "-i".into(),
-            stream.url.clone(),
-        ]);
-    }
-
-    if streams.len() > 1 {
-        args.extend(["-map".to_string(), "0:v:0".into(), "-map".into(), "1:a:0".into()]);
-    } else {
-        args.extend(["-map".to_string(), "0:v:0?".into(), "-map".into(), "0:a:0?".into()]);
-    }
-    args.extend([
-        "-c".to_string(),
-        "copy".into(),
-        "-f".into(),
-        "mpegts".into(),
-        // Written straight through instead of gathering in a buffer first. A
-        // recording ends when the process ends, and whatever was still in that
-        // buffer at the time would be the last seconds of the sitting.
-        "-flush_packets".into(),
-        "1".into(),
-        output.display().to_string(),
-    ]);
-    args
-}
-
-/// Records a broadcast that is still on air, until it ends or the user stops it.
-///
-/// The stopping is the interesting part, and it is why ffmpeg is this program's
-/// own child rather than something yt-dlp started out of reach: a recording has
-/// to be endable at a moment of the user's choosing, and endable *safely*. What
-/// makes it safe is that it is being written as a transport stream, flushed
-/// packet by packet - so ending the process costs the packet in flight and
-/// nothing else, and what is on disk was already a playable recording of
-/// everything up to that instant.
-fn record(
-    job: &Job,
-    source: &Source,
-    temp_dir: &Path,
-    cancel: &AtomicBool,
-    emit: &mut dyn FnMut(FetchEvent),
-) -> Result<Option<PathBuf>, String> {
-    if source.streams.is_empty() {
-        return Err("The site did not say where the live stream is.".into());
-    }
-
-    let raw = temp_dir.join(RECORDING_NAME);
-    let mut command = proc::command(&job.tools.ffmpeg);
-    command.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
-    command.args(["-progress", "pipe:1", "-nostats", "-y"]);
-    command.args(record_args(&source.streams, &raw));
-
-    let mut child = command.spawn().map_err(|e| format!("could not start ffmpeg: {e}"))?;
-    let group = proc::Group::around(&child);
-    let errors = drain(child.stderr.take());
-
-    emit(FetchEvent::Stage(Stage::Recording));
-    let started = Instant::now();
-    let stopped = AtomicBool::new(false);
-    let done = AtomicBool::new(false);
-
-    // Stopping is watched for on a thread of its own, and that is not tidiness.
-    // The obvious place to check is the loop below that reads ffmpeg's progress
-    // - but that loop only runs when ffmpeg has something to say, and a stream
-    // that has gone quiet is exactly when someone reaches for esc. Watching on a
-    // clock instead means stopping never depends on the broadcast still
-    // arriving, and takes effect within a tenth of a second either way.
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !done.load(Ordering::Relaxed) {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if done.load(Ordering::Relaxed) {
-                return;
-            }
-            stopped.store(true, Ordering::Relaxed);
-            // Ended rather than asked. ffmpeg reads a `q` only from a console,
-            // and this one has a pipe; the transport stream it has been writing
-            // is what makes ending it safe, so there is nothing to gain by
-            // waiting for a keystroke that will not be read.
-            group.kill_detached();
-        });
-
-        if let Some(stdout) = child.stdout.take() {
-            let mut announced = false;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if stopped.load(Ordering::Relaxed) && !announced {
-                    announced = true;
-                    emit(FetchEvent::Stage(Stage::Finishing));
-                }
-                match parse_recording(&line) {
-                    Some(Recorded::Bytes(bytes)) => {
-                        let elapsed = started.elapsed().as_secs_f64();
-                        let rate = if elapsed > 0.2 { bytes as f64 / elapsed } else { 0.0 };
-                        // No total and no estimate, and that is not a gap in the
-                        // reporting: a broadcast still running has neither.
-                        emit(FetchEvent::Progress { done: bytes, total: None, rate, eta: None });
-                    }
-                    Some(Recorded::Seconds(seconds)) => emit(FetchEvent::Captured(seconds)),
-                    None => {}
-                }
-            }
-        }
-        // ffmpeg has closed its output, so it is on its way out. Releasing the
-        // watcher here is what stops it counting down a grace period against a
-        // recording that has already finished.
-        done.store(true, Ordering::Relaxed);
-    });
-
-    let status = child.wait().map_err(|e| format!("waiting for ffmpeg: {e}"))?;
-    let stderr = errors.join().unwrap_or_default();
-    let asked_to_stop = stopped.load(Ordering::Relaxed);
-
-    let captured = fs::metadata(&raw).map(|m| m.len()).unwrap_or(0);
-    if captured == 0 {
-        let tail = proc::error_tail(&stderr, 3);
-        return Err(if tail.is_empty() {
-            "The broadcast produced nothing to record.".into()
-        } else {
-            tail
-        });
-    }
-    // A stopped recording exits non-zero, and so does one that lost the stream
-    // half way through a three-hour sitting. Neither is a reason to throw away
-    // what is already on disk, because those bytes are there and they play. So
-    // what ffmpeg made of the ending is a note, not a failure.
-    if !status.success() && !asked_to_stop {
-        let tail = proc::error_tail(&stderr, 2);
-        if !tail.is_empty() {
-            emit(FetchEvent::Note(format!("The broadcast ended early: {tail}")));
-        }
-    }
-
-    emit(FetchEvent::Stage(Stage::Finishing));
-    let extension = if job.quality.is_audio() { "m4a" } else { "mp4" };
-    let stem = file_stem_for(source.title.as_deref().unwrap_or("recording"));
-    let output = free_path(&job.folder, &stem, extension);
-    remux(&job.tools.ffmpeg, &raw, &output, captured, emit)?;
-    Ok(Some(output))
-}
-
-/// Puts a finished recording into the container it should end up in, without
-/// touching a frame of it.
-///
-/// `-c copy` throughout, so this is a copy of the bytes rather than an encode.
-/// The bar it reports is honest for the same reason: a remux writes very nearly
-/// the number of bytes it reads, so the source's size is a real total and not a
-/// guess dressed up as one.
-fn remux(
-    ffmpeg: &Path,
-    from: &Path,
-    to: &Path,
-    source_size: u64,
-    emit: &mut dyn FnMut(FetchEvent),
-) -> Result<(), String> {
-    let mut command = proc::command(ffmpeg);
-    command.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
-    command.args(["-progress", "pipe:1", "-nostats", "-y", "-i"]);
-    command.arg(from);
-    command.args(["-c", "copy", "-movflags", "+faststart"]);
-    command.arg(to);
-
-    let mut child = command.spawn().map_err(|e| format!("could not start ffmpeg: {e}"))?;
-    let errors = drain(child.stderr.take());
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(Recorded::Bytes(bytes)) = parse_recording(&line) {
-                emit(FetchEvent::Progress {
-                    done: bytes,
-                    total: Some(source_size.max(bytes)),
-                    rate: 0.0,
-                    eta: None,
-                });
-            }
-        }
-    }
-    let status = child.wait().map_err(|e| format!("waiting for ffmpeg: {e}"))?;
-    if status.success() && to.is_file() {
-        return Ok(());
-    }
-    let tail = proc::error_tail(&errors.join().unwrap_or_default(), 3);
-    Err(if tail.is_empty() {
-        "the recording could not be put into its final file".to_string()
-    } else {
-        format!("the recording could not be put into its final file: {tail}")
-    })
-}
-
-/// One useful number out of an ffmpeg `-progress` line.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Recorded {
-    /// Bytes written to the file so far.
-    Bytes(u64),
-    /// Running time captured so far, in seconds.
-    Seconds(f64),
-}
-
-fn parse_recording(line: &str) -> Option<Recorded> {
-    let (key, value) = line.split_once('=')?;
-    let value = value.trim();
-    match key.trim() {
-        "total_size" => value.parse().ok().map(Recorded::Bytes),
-        // Microseconds, despite what the older of the two names suggests.
-        "out_time_us" | "out_time_ms" => {
-            let micros: f64 = value.parse().ok()?;
-            (micros >= 0.0).then_some(Recorded::Seconds(micros / 1_000_000.0))
-        }
-        _ => None,
-    }
 }
 
 /// Reads a child's pipe to the end on a thread of its own.
@@ -1105,6 +767,9 @@ fn download(
     job: &Job,
     temp_dir: &Path,
     cancel: &AtomicBool,
+    // Whether this is a broadcast still on air, which changes both what yt-dlp
+    // is asked for and what stopping half way through means.
+    live: bool,
     // What the asking pass already reported, so the same name is not announced
     // a second time once the progress lines start carrying it.
     known_title: Option<&str>,
@@ -1112,9 +777,10 @@ fn download(
 ) -> Result<Option<PathBuf>, String> {
     let ffmpeg_dir = job.tools.ffmpeg.parent();
     let mut command = proc::command(ytdlp);
-    command.args(args(job, temp_dir, ffmpeg_dir));
+    command.args(args(job, temp_dir, ffmpeg_dir, live));
 
     let mut child = command.spawn().map_err(|e| format!("could not start yt-dlp: {e}"))?;
+    let group = proc::Group::around(&child);
 
     let stderr = child.stderr.take();
     let drain = std::thread::spawn(move || {
@@ -1135,7 +801,7 @@ fn download(
         let mut raw = Vec::new();
         loop {
             if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
+                group.kill(&mut child);
                 break;
             }
             raw.clear();
@@ -1177,6 +843,7 @@ fn download(
                         total: progress.total,
                         rate: progress.rate,
                         eta: progress.eta,
+                        fragments: progress.fragments,
                     });
                 }
                 Status::Finished => {
@@ -1186,6 +853,7 @@ fn download(
                         total: progress.total.or(Some(progress.done)),
                         rate: progress.rate,
                         eta: None,
+                        fragments: progress.fragments,
                     });
                     // Either another stream follows - which restarts the bar
                     // above - or ffmpeg is now joining what arrived.
@@ -1200,6 +868,15 @@ fn download(
     let stderr = drain.join().unwrap_or_default();
 
     if cancel.load(Ordering::Relaxed) {
+        // A stopped download of a finished video is worth nothing - the file is
+        // a fragment of something that still exists in full, and can simply be
+        // fetched again. A stopped recording is the opposite: the part of the
+        // broadcast it holds is gone the moment the broadcast ends, so it is
+        // salvaged rather than swept up with the working folder.
+        if live {
+            emit(FetchEvent::Stage(Stage::Finishing));
+            return salvage(job, temp_dir, known_title, emit).map(Some);
+        }
         return Err("Cancelled.".into());
     }
     if status.success() {
@@ -1214,6 +891,125 @@ fn download(
     } else {
         tail
     })
+}
+
+/// A title turned into something Windows will accept as a filename.
+///
+/// The same job `--windows-filenames` does for a download that runs to the end,
+/// done here because a salvaged recording names its own output rather than being
+/// named by yt-dlp. The reserved characters become underscores rather than
+/// vanishing, so two titles differing only in punctuation do not collapse into
+/// one name.
+fn file_stem_for(title: &str) -> String {
+    let mut stem = String::with_capacity(title.len());
+    for c in title.chars() {
+        match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => stem.push('_'),
+            c if (c as u32) < 0x20 => stem.push('_'),
+            c => stem.push(c),
+        }
+    }
+    // Windows silently drops these from the end of a name, so a file would be
+    // written under one name and then not be found under it.
+    let stem = stem.trim().trim_end_matches('.').trim();
+
+    // Long titles make paths nothing can open. The same 120 bytes the download
+    // path asks for, cut on a character boundary so the name stays valid text.
+    let mut cut = stem.len().min(120);
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = stem[..cut].trim_end();
+    if stem.is_empty() { "recording".to_string() } else { stem.to_string() }
+}
+
+/// A path in `folder` that no file is using yet.
+///
+/// A sitting stopped and restarted would otherwise overwrite the first attempt,
+/// and the first attempt is the one with the beginning of it.
+fn free_path(folder: &Path, stem: &str, extension: &str) -> PathBuf {
+    let first = folder.join(format!("{stem}.{extension}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = folder.join(format!("{stem} ({n}).{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Turns what a stopped recording left behind into a file that plays.
+///
+/// yt-dlp writes each stream to its own `.part` while it works and only joins
+/// them at the end, so a recording stopped part way through leaves two of them -
+/// the picture in one and the sound in the other - and no finished video at all.
+/// Both are complete files as far as they go, which is what makes this possible:
+/// joining them copies the streams without re-encoding anything, and what comes
+/// out is every minute that had arrived when the user pressed esc.
+fn salvage(
+    job: &Job,
+    temp_dir: &Path,
+    known_title: Option<&str>,
+    emit: &mut dyn FnMut(FetchEvent),
+) -> Result<PathBuf, String> {
+    let parts = part_files(temp_dir);
+    if parts.is_empty() {
+        return Err("Stopped before anything had arrived, so there was nothing to keep.".into());
+    }
+
+    let extension = if job.quality.is_audio() { "m4a" } else { "mp4" };
+    let stem = file_stem_for(known_title.unwrap_or("recording"));
+    let output = free_path(&job.folder, &stem, extension);
+
+    let mut command = proc::command(&job.tools.ffmpeg);
+    command.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"]);
+    for part in &parts {
+        command.arg("-i");
+        command.arg(part);
+    }
+    // Named rather than left to ffmpeg's own choice, which would take every
+    // stream from the first input only and drop the sound entirely.
+    for (n, _) in parts.iter().enumerate() {
+        command.args(["-map".to_string(), format!("{n}")]);
+    }
+    command.args(["-c", "copy"]);
+    command.arg(&output);
+
+    let result = proc::run_captured(command).map_err(|e| format!("could not start ffmpeg: {e}"))?;
+    if !result.status.success() || !output.is_file() {
+        let tail = proc::error_tail(&result.stderr, 3);
+        return Err(if tail.is_empty() {
+            "What had been recorded could not be written out.".into()
+        } else {
+            format!("What had been recorded could not be written out: {tail}")
+        });
+    }
+    emit(FetchEvent::Note("Kept everything recorded up to the moment you stopped.".into()));
+    Ok(output)
+}
+
+/// The part-written streams in the working folder, biggest last so the picture -
+/// which is always the larger of the two - is not what the sound is mapped over.
+///
+/// yt-dlp also leaves a `.part-FragNNN.part` behind for the single fragment it
+/// was in the middle of, and that one is a few kilobytes of nothing useful.
+fn part_files(temp_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(temp_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.ends_with(PART) && !name.contains(".part-Frag")
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// The fallback for a run that downloaded something but did not say where.
@@ -1253,6 +1049,11 @@ struct Progress {
     total: Option<u64>,
     rate: f64,
     eta: Option<f64>,
+    /// How far through the pieces the stream is broken into, when it is broken
+    /// into pieces at all. The only measure a live broadcast has: it has no
+    /// byte total, because nobody knows how big something still happening will
+    /// be, but the site does say how many pieces there are so far.
+    fragments: Option<(u64, u64)>,
     title: Option<String>,
 }
 
@@ -1261,12 +1062,12 @@ impl Progress {
     ///
     /// yt-dlp writes `NA` for any field it does not know yet, which is most of
     /// them on the first line of a live stream, so every value here is optional
-    /// in practice even though the template always produces seven of them.
+    /// in practice even though the template always produces nine of them.
     fn parse(line: &str) -> Option<Self> {
         let rest = line.trim().strip_prefix(PROGRESS_TAG)?.trim_start();
         // The title goes last precisely because it is the one field that can
-        // contain spaces, so the six before it split off cleanly.
-        let mut parts = rest.splitn(7, ' ');
+        // contain spaces, so the eight before it split off cleanly.
+        let mut parts = rest.splitn(9, ' ');
 
         let status = match parts.next()? {
             "downloading" => Status::Downloading,
@@ -1283,6 +1084,8 @@ impl Progress {
         let estimated = number(parts.next());
         let rate = number(parts.next()).unwrap_or(0.0);
         let eta = number(parts.next());
+        let index = number(parts.next());
+        let count = number(parts.next());
         let title = parts
             .next()
             .map(str::trim)
@@ -1298,6 +1101,12 @@ impl Progress {
             total: declared.or(estimated).map(|n| n as u64).filter(|n| *n > 0),
             rate,
             eta,
+            // Both or neither: a position with nothing to be a position within
+            // is not a measurement, and would draw a bar that only ever grows.
+            fragments: index
+                .zip(count)
+                .map(|(i, c)| (i as u64, c as u64))
+                .filter(|(i, c)| *c > 0 && i <= c),
             title,
         })
     }
@@ -1354,7 +1163,12 @@ mod tests {
 
     fn args_for(quality: FetchQuality) -> Vec<String> {
         let job = job(quality);
-        args(&job, Path::new("C:/clips/_download_temp_1"), job.tools.ffmpeg.parent())
+        args(&job, Path::new("C:/clips/_download_temp_1"), job.tools.ffmpeg.parent(), false)
+    }
+
+    fn live_args_for(quality: FetchQuality) -> Vec<String> {
+        let job = job(quality);
+        args(&job, Path::new("C:/clips/_download_temp_1"), job.tools.ffmpeg.parent(), true)
     }
 
     fn info(fields: &str) -> String {
@@ -1388,34 +1202,7 @@ mod tests {
         assert_eq!(read_info(&info(r#""url":"https://x/v.mp4""#)).unwrap().live, Live::No);
     }
 
-    /// Where the stream is, in both shapes yt-dlp reports it: one file carrying
-    /// both tracks, or the best video and the best audio in separate files.
-    #[test]
-    fn the_streams_to_record_are_found_in_either_shape() {
-        let single = read_info(&info(
-            r#""live_status":"is_live","url":"https://x/live.m3u8","http_headers":{"User-Agent":"vm","Accept-Encoding":"gzip"}"#,
-        ))
-        .unwrap();
-        assert_eq!(single.streams.len(), 1);
-        assert_eq!(single.streams[0].url, "https://x/live.m3u8");
-        // Compression ffmpeg did not ask for and will not undo.
-        assert_eq!(single.streams[0].headers, vec![("User-Agent".into(), "vm".into())]);
-
-        let split = read_info(&info(
-            r#""live_status":"is_live","url":"https://x/ignored","requested_formats":[{"url":"https://x/video.m3u8","http_headers":{"User-Agent":"vm"}},{"url":"https://x/audio.m3u8"}]"#,
-        ))
-        .unwrap();
-        let urls: Vec<&str> = split.streams.iter().map(|s| s.url.as_str()).collect();
-        assert_eq!(urls, ["https://x/video.m3u8", "https://x/audio.m3u8"]);
-        assert!(split.streams[1].headers.is_empty());
-
-        // Nothing to point ffmpeg at is not a crash, and not a silent success
-        // either - `record` refuses it by name.
-        let bare = read_info(&info(r#""live_status":"is_live""#)).unwrap();
-        assert!(bare.streams.is_empty());
-    }
-
-    #[test]
+        #[test]
     fn an_answer_that_is_not_an_answer_is_refused() {
         // Warnings reach stderr, but a stray line on stdout must not stop the
         // document after it from being read.
@@ -1426,53 +1213,32 @@ mod tests {
         assert!(read_info("{not json at all").is_err());
     }
 
-    /// ffmpeg is handed a URL and told where to put what comes back. Both
-    /// matter: the wrong map loses a track, and a missing `-c copy` would try to
-    /// re-encode a live 1080p stream in real time.
+    /// The whole difference between watching a sitting from now and keeping the
+    /// hour of it that has already gone out. Without this flag that hour cannot
+    /// be had at all once the broadcast ends.
     #[test]
-    fn the_recorder_is_told_to_copy_and_to_follow_the_stream() {
-        let one = [Stream {
-            url: "https://x/live.m3u8".into(),
-            headers: vec![("User-Agent".into(), "vm".into())],
-        }];
-        let args = record_args(&one, Path::new("C:/temp/recording.ts"));
-        let joined = args.join(" ");
-        assert!(joined.contains("-c copy"), "got {joined}");
-        assert!(joined.contains("-f mpegts"), "got {joined}");
-        assert!(joined.contains("-reconnect_streamed 1"), "got {joined}");
-        assert_eq!(args.last().unwrap(), "C:/temp/recording.ts");
-        // Optional, so asking for a picture an audio-only capture does not have
-        // is not an error.
-        assert!(joined.contains("-map 0:v:0? -map 0:a:0?"), "got {joined}");
-        let headers = args[args.iter().position(|a| a == "-headers").expect("headers") + 1].clone();
-        assert_eq!(headers, "User-Agent: vm\r\n");
-
-        // Two files: the picture comes from one input and the sound the other.
-        let two = [
-            Stream { url: "https://x/v.m3u8".into(), headers: Vec::new() },
-            Stream { url: "https://x/a.m3u8".into(), headers: Vec::new() },
-        ];
-        let args = record_args(&two, Path::new("C:/temp/recording.ts"));
-        assert!(args.join(" ").contains("-map 0:v:0 -map 1:a:0"), "got {args:?}");
-        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 2);
-    }
-
-    #[test]
-    fn recording_progress_is_read_from_ffmpeg() {
-        assert_eq!(parse_recording("total_size=4456448"), Some(Recorded::Bytes(4_456_448)));
-        assert_eq!(parse_recording("out_time_us=2500000"), Some(Recorded::Seconds(2.5)));
-        assert_eq!(parse_recording("out_time_ms=1000000"), Some(Recorded::Seconds(1.0)));
-        // Everything else in the block, which is most of it.
-        for other in ["frame=42", "progress=continue", "bitrate=1122.5kbits/s", "speed=1x", ""] {
-            assert_eq!(parse_recording(other), None, "{other:?}");
+    fn a_live_link_is_taken_from_the_start_of_the_broadcast() {
+        for quality in FetchQuality::ALL {
+            let live = live_args_for(quality);
+            assert!(live.iter().any(|a| a == "--live-from-start"), "{quality:?}");
+            // A finished video has no start to be taken from, and asking for one
+            // makes yt-dlp refuse the link outright.
+            let ordinary = args_for(quality);
+            assert!(!ordinary.iter().any(|a| a == "--live-from-start"), "{quality:?}");
         }
-        // Written before anything has been, and not a length of -1 seconds.
-        assert_eq!(parse_recording("out_time_us=N/A"), None);
-        assert_eq!(parse_recording("total_size=N/A"), None);
     }
 
-    /// A recording names its own file, so every rule `--windows-filenames` would
-    /// have applied has to be applied here instead.
+    /// A live broadcast declares no size, so the fragment counts are the only
+    /// thing a bar can honestly be drawn from. They have to be asked for.
+    #[test]
+    fn the_progress_template_asks_how_many_pieces_there_are() {
+        let joined = args_for(FetchQuality::P1080).join(" ");
+        assert!(joined.contains("%(progress.fragment_index)s"), "got {joined}");
+        assert!(joined.contains("%(progress.fragment_count)s"), "got {joined}");
+    }
+
+    /// A salvaged recording names its own file, so every rule
+    /// `--windows-filenames` would have applied has to be applied here instead.
     #[test]
     fn a_title_becomes_a_filename_windows_will_take() {
         assert_eq!(file_stem_for("20th Majlis - 26th Sitting"), "20th Majlis - 26th Sitting");
@@ -1503,7 +1269,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn a_second_recording_does_not_overwrite_the_first() {
+    fn a_second_salvaged_recording_does_not_overwrite_the_first() {
         let dir = std::env::temp_dir().join(format!("vmerge-free-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1527,7 +1293,7 @@ mod tests {
         for quality in FetchQuality::ALL {
             let job = job(quality);
             let asked = selection_args(&job);
-            let fetched = args(&job, Path::new("C:/clips/_download_temp_1"), None);
+            let fetched = args(&job, Path::new("C:/clips/_download_temp_1"), None, false);
             let format_of = |args: &[String]| {
                 args.iter().position(|a| a == "-f").map(|i| args[i + 1].clone())
             };
@@ -1541,7 +1307,7 @@ mod tests {
 
     #[test]
     fn progress_lines_are_read() {
-        let line = "VMPROG downloading 1048576 10485760 NA 524288.0 18 A Video Title";
+        let line = "VMPROG downloading 1048576 10485760 NA 524288.0 18 NA NA A Video Title";
         let parsed = Progress::parse(line).expect("a progress line");
         assert_eq!(parsed.status, Status::Downloading);
         assert_eq!(parsed.done, 1_048_576);
@@ -1555,7 +1321,7 @@ mod tests {
     /// last. Splitting on every space would cut it into pieces.
     #[test]
     fn a_title_with_spaces_survives_whole() {
-        let line = "VMPROG downloading 1 2 NA 3 4 how to make bread - part 2";
+        let line = "VMPROG downloading 1 2 NA 3 4 NA NA how to make bread - part 2";
         let parsed = Progress::parse(line).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("how to make bread - part 2"));
     }
@@ -1564,15 +1330,33 @@ mod tests {
     /// to cope with that rather than showing a total of zero.
     #[test]
     fn unknown_fields_become_nothing_rather_than_zero() {
-        let parsed = Progress::parse("VMPROG downloading 0 NA NA NA NA NA").unwrap();
+        let parsed = Progress::parse("VMPROG downloading 0 NA NA NA NA NA NA NA").unwrap();
         assert_eq!(parsed.done, 0);
         assert_eq!(parsed.total, None, "no total means no bar, not a bar at 0/0");
         assert_eq!(parsed.eta, None);
         assert_eq!(parsed.title, None);
 
         // An estimate stands in for a declared length when there is not one.
-        let parsed = Progress::parse("VMPROG downloading 500 NA 4096 100 5 x").unwrap();
+        let parsed = Progress::parse("VMPROG downloading 500 NA 4096 100 5 NA NA x").unwrap();
         assert_eq!(parsed.total, Some(4096));
+    }
+
+    /// The counts a live broadcast is measured by. It declares no size, so
+    /// without these there is nothing to draw a bar from at all.
+    #[test]
+    fn the_pieces_of_a_live_stream_are_counted() {
+        let line = "VMPROG downloading 51503359 NA NA 168546.7 NA 322 1877 A Sitting";
+        let parsed = Progress::parse(line).expect("a progress line");
+        assert_eq!(parsed.fragments, Some((322, 1877)));
+        assert_eq!(parsed.total, None, "a live broadcast has no size to declare");
+        assert_eq!(parsed.title.as_deref(), Some("A Sitting"));
+
+        // Neither is any use without the other, and a position past the end is
+        // not a position. All three would draw a bar that means nothing.
+        for (index, count) in [("NA", "1877"), ("322", "NA"), ("322", "0"), ("1900", "1877")] {
+            let line = format!("VMPROG downloading 1 NA NA 1 NA {index} {count} x");
+            assert_eq!(Progress::parse(&line).unwrap().fragments, None, "{index}/{count}");
+        }
     }
 
     #[test]
@@ -1580,7 +1364,7 @@ mod tests {
         for line in [
             "",
             "[download] Destination: video.mp4",
-            "VMPROG something-else 1 2 3 4 5 x",
+            "VMPROG something-else 1 2 3 4 5 6 7 x",
             "  [youtube] abc: Downloading webpage",
         ] {
             assert_eq!(Progress::parse(line), None, "{line:?} is not progress");
@@ -1622,7 +1406,7 @@ mod tests {
 
     #[test]
     fn the_finished_status_closes_the_bar() {
-        let parsed = Progress::parse("VMPROG finished 10485760 10485760 NA NA NA Clip").unwrap();
+        let parsed = Progress::parse("VMPROG finished 10485760 10485760 NA NA NA NA NA Clip").unwrap();
         assert_eq!(parsed.status, Status::Finished);
         assert_eq!(parsed.done, parsed.total.unwrap());
     }

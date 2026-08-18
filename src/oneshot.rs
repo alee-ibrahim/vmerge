@@ -232,7 +232,6 @@ pub fn download(tools: Arc<Tools>, options: Download) -> Result<bool> {
     // how far through it is, because there is no "through" to be far along.
     let mut recording = false;
     let mut finishing = false;
-    let mut captured = 0.0f64;
     // Redirected output gets a line per stream rather than a bar it cannot draw,
     // so a log ends up with a record instead of carriage-return litter.
     let mut logged_percent = 0u32;
@@ -251,23 +250,28 @@ pub fn download(tools: Arc<Tools>, options: Download) -> Result<bool> {
             recording = stage == Stage::Recording;
             finishing = stage == Stage::Finishing;
             if recording {
-                redraw("  This is live, and recording it runs until the broadcast", true, tty);
-                redraw("  ends or you press ctrl-c.", true, tty);
+                // What it is doing has already been said, by the note every
+                // screen gets. What only this one needs is which key stops it.
+                redraw("  Press ctrl-c to stop and keep what has arrived.", true, tty);
                 last_percent = u32::MAX;
             }
         }
-        FetchEvent::Captured(seconds) => captured = seconds,
         FetchEvent::Stream(n) => {
             stream = n;
             last_percent = u32::MAX;
             logged_percent = 0;
         }
-        FetchEvent::Progress { done, total, rate, eta } => {
+        FetchEvent::Progress { done, total, rate, eta, fragments } => {
             if recording {
+                let through = match fragments {
+                    Some((at, count)) if count > 0 => {
+                        format!("{:>3.0}%", (at as f64 / count as f64) * 100.0)
+                    }
+                    _ => "  --".to_string(),
+                };
                 redraw(
                     &format!(
-                        "  recording  {} captured   {} at {}",
-                        format::short_duration(captured),
+                        "  recording  {through} of the broadcast so far   {} at {}",
                         format::size(done),
                         format::rate(rate)
                     ),

@@ -278,10 +278,10 @@ pub struct FetchView {
     pub total: Option<u64>,
     pub rate: f64,
     pub eta: Option<f64>,
-    /// How much of a live broadcast is in the file, in seconds of running time.
-    /// None until something says otherwise, which is also how the screen knows
-    /// this is a recording rather than a download.
-    pub captured: Option<f64>,
+    /// Pieces done and pieces there are, for a stream that arrives in pieces.
+    /// What a live broadcast is measured by: it has no byte total, but the site
+    /// says how much of it has been broadcast so far.
+    pub fragments: Option<(u64, u64)>,
     pub notes: Vec<String>,
     pub started: Instant,
 }
@@ -297,7 +297,7 @@ impl FetchView {
             total: None,
             rate: 0.0,
             eta: None,
-            captured: None,
+            fragments: None,
             notes: Vec::new(),
             started: Instant::now(),
         }
@@ -315,8 +315,15 @@ impl FetchView {
     /// server has not said how big it is - a bar drawn without a total is a
     /// guess dressed up as a measurement.
     pub fn fraction(&self) -> Option<f64> {
-        let total = self.total.filter(|t| *t > 0)?;
-        Some((self.done as f64 / total as f64).clamp(0.0, 1.0))
+        if let Some(total) = self.total.filter(|t| *t > 0) {
+            return Some((self.done as f64 / total as f64).clamp(0.0, 1.0));
+        }
+        // No declared size, which is every live broadcast: nobody knows how big
+        // something still happening will be. The pieces it arrives in are
+        // counted though, and how many there are is a real number rather than an
+        // estimate, so the bar drawn from them is measuring something.
+        let (done, count) = self.fragments.filter(|(_, count)| *count > 0)?;
+        Some((done as f64 / count as f64).clamp(0.0, 1.0))
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -1049,6 +1056,7 @@ impl App {
                 if stage == Stage::Finishing && view.is_recording() {
                     view.done = 0;
                     view.total = None;
+                    view.fragments = None;
                 }
                 view.stage = stage;
             }
@@ -1063,14 +1071,20 @@ impl App {
                 view.done = 0;
                 view.total = None;
                 view.eta = None;
+                view.fragments = None;
             }
-            FetchEvent::Progress { done, total, rate, eta } => {
+            FetchEvent::Progress { done, total, rate, eta, fragments } => {
                 view.done = done;
                 view.total = total;
                 view.rate = rate;
                 view.eta = eta;
+                // Kept rather than overwritten with nothing: yt-dlp reports the
+                // counts only while a fragmented stream is actually moving, and
+                // a bar that vanished between two lines would flicker.
+                if fragments.is_some() {
+                    view.fragments = fragments;
+                }
             }
-            FetchEvent::Captured(seconds) => view.captured = Some(seconds),
             FetchEvent::Finished(_) => unreachable!("handled above"),
         }
     }

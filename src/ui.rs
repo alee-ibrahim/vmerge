@@ -977,19 +977,13 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
     );
 
     let width = bar_line.width.saturating_sub(4) as usize;
-    // A broadcast still running has no end to be a fraction of, so what the bar
-    // carries instead is the one number that is real: how much is in the file.
-    // The sweep beside it is there to show the capture is still alive, which a
-    // timecode ticking once a second does not do on its own.
-    if view.is_recording() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{}  ", format::short_duration(view.captured.unwrap_or(0.0))),
-                theme.strong(),
-            ))
-            .alignment(Alignment::Right),
-            bar_label,
-        );
+    // A live broadcast is drawn against what has been broadcast so far rather
+    // than against a finished length, because there is no finished length -
+    // which is why the bar creeps rather than filling, and why it never quite
+    // arrives while the sitting is still going. Until the first counts come
+    // through there is nothing to draw at all, and a sweep says "working" where
+    // a bar would have to invent a position.
+    if view.is_recording() && view.fraction().is_none() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw("  "),
@@ -1003,9 +997,13 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
     } else {
     match view.fraction() {
         Some(fraction) => {
+            // "84%" of a download means it is nearly here. Of a broadcast still
+            // running it means something else entirely - how much of what has
+            // gone out so far is on disk - and the two must not read alike.
+            let of_what = if view.is_recording() { " of the broadcast so far" } else { "" };
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    format!("{:>3.0}%  ", fraction * 100.0),
+                    format!("{:>3.0}%{of_what}  ", fraction * 100.0),
                     theme.strong(),
                 ))
                 .alignment(Alignment::Right),

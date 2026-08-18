@@ -272,24 +272,6 @@ impl Group {
         let _ = child.kill();
     }
 
-    /// Ends the group without needing the child to hand.
-    ///
-    /// For the thread watching a recording, which has no business holding the
-    /// child while another thread is reading its output. Answers whether it
-    /// actually killed anything: without a job object there is nothing here to
-    /// kill *with*, and saying so lets the caller stop pretending it worked.
-    #[cfg(windows)]
-    pub fn kill_detached(&self) -> bool {
-        match self.job {
-            Some(handle) => unsafe { job::TerminateJobObject(handle, 1) != 0 },
-            None => false,
-        }
-    }
-
-    #[cfg(not(windows))]
-    pub fn kill_detached(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(windows)]
