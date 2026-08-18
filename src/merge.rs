@@ -85,6 +85,11 @@ pub struct Outcome {
     pub warnings: Vec<String>,
     pub error: Option<String>,
     pub cancelled: bool,
+    /// The file is a live broadcast captured as it happened, rather than a
+    /// finished video fetched or clips joined. Stopping one of these on
+    /// purpose is how it is *meant* to end, so the report has to be able to
+    /// tell that apart from a download the user gave up on.
+    pub recorded: bool,
 }
 
 pub struct Job {
@@ -152,6 +157,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
         warnings: Vec::new(),
         error: None,
         cancelled: false,
+        recorded: false,
     };
 
     if job.clips.is_empty() {

@@ -10,9 +10,10 @@ use anyhow::{Result, bail};
 
 use crate::collect;
 use crate::encoder::{EncoderPref, Quality};
-use crate::fetch::{self, FetchEvent, FetchQuality};
+use crate::fetch::{self, FetchEvent, FetchQuality, Stage};
 use crate::ffmpeg::Tools;
 use crate::format;
+use crate::proc;
 use crate::merge::{self, MergeEvent};
 use crate::probe::{self, ClipInfo};
 
@@ -221,30 +222,63 @@ pub fn download(tools: Arc<Tools>, options: Download) -> Result<bool> {
         allow_download: options.allow_download,
     };
 
-    let cancel = AtomicBool::new(false);
+    // ctrl-c asks the job to stop rather than killing it, so a live recording
+    // gets to close its file instead of being cut off mid-write.
+    let cancel = proc::stop_on_interrupt();
     let tty = std::io::stdout().is_terminal();
     let mut stream = 0u32;
     let mut last_percent = u32::MAX;
+    // A live broadcast reports how much running time is in the file rather than
+    // how far through it is, because there is no "through" to be far along.
+    let mut recording = false;
+    let mut finishing = false;
+    let mut captured = 0.0f64;
     // Redirected output gets a line per stream rather than a bar it cannot draw,
     // so a log ends up with a record instead of carriage-return litter.
     let mut logged_percent = 0u32;
 
-    let outcome = fetch::run(&job, &cancel, &mut |event| match event {
+    let outcome = fetch::run(&job, cancel, &mut |event| match event {
         FetchEvent::Note(line) => redraw(&format!("  {line}"), true, tty),
         FetchEvent::Title(title) => redraw(&format!("  {title}"), true, tty),
-        // Not announced here, unlike on the interactive screen. A stream ending
-        // means either that ffmpeg is now joining or that a second stream is
-        // about to start, and the plain console cannot take a line back once it
-        // has printed it - so it says nothing rather than something it may have
-        // to contradict two lines later.
-        FetchEvent::Stage(_) => {}
+        // Mostly not announced here, unlike on the interactive screen. A stream
+        // ending means either that ffmpeg is now joining or that a second
+        // stream is about to start, and the plain console cannot take a line
+        // back once it has printed it - so it says nothing rather than
+        // something it may have to contradict two lines later. Recording is the
+        // exception: which of the two jobs is running changes what every line
+        // after it means.
+        FetchEvent::Stage(stage) => {
+            recording = stage == Stage::Recording;
+            finishing = stage == Stage::Finishing;
+            if recording {
+                redraw("  This is live, and recording it runs until the broadcast", true, tty);
+                redraw("  ends or you press ctrl-c.", true, tty);
+                last_percent = u32::MAX;
+            }
+        }
+        FetchEvent::Captured(seconds) => captured = seconds,
         FetchEvent::Stream(n) => {
             stream = n;
             last_percent = u32::MAX;
             logged_percent = 0;
         }
         FetchEvent::Progress { done, total, rate, eta } => {
-            let where_ = if stream > 1 {
+            if recording {
+                redraw(
+                    &format!(
+                        "  recording  {} captured   {} at {}",
+                        format::short_duration(captured),
+                        format::size(done),
+                        format::rate(rate)
+                    ),
+                    false,
+                    tty,
+                );
+                return;
+            }
+            let where_ = if finishing {
+                "  putting it together".to_string()
+            } else if stream > 1 {
                 format!("  stream {stream}")
             } else {
                 "  downloading".to_string()

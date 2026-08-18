@@ -44,9 +44,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
-# Miri is deliberately absent. There is exactly one unsafe block in the whole
-# crate - the SetFileAttributesW call in src/proc.rs - and it is #[cfg(windows)],
-# so on a Linux runner Miri would have nothing to check; it cannot evaluate FFI
+# Miri is deliberately absent. Every unsafe block in the crate is in src/proc.rs
+# and every one of them is #[cfg(windows)] - SetFileAttributesW, the job object
+# that stops a child taking its own children with it, and the ctrl-c handler - so
+# on a Linux runner Miri would have nothing to check; it cannot evaluate FFI
 # calls in any case. It would also fail as written: the ffmpeg and merge tests
 # write real files, and Miri blocks filesystem access unless it is run with
 # -Zmiri-disable-isolation. If it is ever worth adding, it needs both that flag

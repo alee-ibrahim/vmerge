@@ -84,6 +84,9 @@ pub enum Confirm {
     Overwrite(PathBuf),
     CancelMerge,
     CancelFetch,
+    /// Finishing a live capture on purpose. Not a cancellation in anything but
+    /// the mechanism: it is how a recording ends, and it keeps the file.
+    StopRecording,
 }
 
 /// One section of the key reference.
@@ -275,6 +278,10 @@ pub struct FetchView {
     pub total: Option<u64>,
     pub rate: f64,
     pub eta: Option<f64>,
+    /// How much of a live broadcast is in the file, in seconds of running time.
+    /// None until something says otherwise, which is also how the screen knows
+    /// this is a recording rather than a download.
+    pub captured: Option<f64>,
     pub notes: Vec<String>,
     pub started: Instant,
 }
@@ -290,9 +297,18 @@ impl FetchView {
             total: None,
             rate: 0.0,
             eta: None,
+            captured: None,
             notes: Vec::new(),
             started: Instant::now(),
         }
+    }
+
+    /// Whether what is on screen is a broadcast being captured as it happens.
+    ///
+    /// Read off the stage rather than remembered separately, so the screen and
+    /// the worker cannot disagree about which of the two jobs is running.
+    pub fn is_recording(&self) -> bool {
+        matches!(self.stage, Stage::Recording)
     }
 
     /// 0.0 to 1.0 through the stream currently arriving, or None when the
@@ -932,9 +948,17 @@ impl App {
     }
 
     pub fn request_cancel(&mut self) {
-        match self.screen {
+        match &self.screen {
             Screen::Merging(_) => self.overlay = Overlay::Confirm(Confirm::CancelMerge),
-            Screen::Fetching(_) => self.overlay = Overlay::Confirm(Confirm::CancelFetch),
+            Screen::Fetching(view) => {
+                // Stopping a recording keeps what it has and stopping a download
+                // throws it away, so the two cannot share a question.
+                self.overlay = Overlay::Confirm(if view.is_recording() {
+                    Confirm::StopRecording
+                } else {
+                    Confirm::CancelFetch
+                });
+            }
             _ => {}
         }
     }
@@ -990,13 +1014,18 @@ impl App {
         // A finished download switches screens; everything else updates the view.
         if let FetchEvent::Finished(outcome) = event {
             let kind = if outcome.ok { Kind::Good } else { Kind::Bad };
-            let message = if outcome.cancelled {
-                "Download stopped.".to_string()
-            } else if outcome.ok {
+            // What was produced comes before how it ended. Stopping a recording
+            // is how a recording is supposed to finish, so a file that exists
+            // gets announced as one whether or not the user pressed esc to get
+            // it - anything else would report a successful capture as a loss.
+            let message = if outcome.ok {
+                let verb = if outcome.recorded { "Recorded" } else { "Downloaded" };
                 match outcome.output.file_name() {
-                    Some(name) => format!("Downloaded {}", name.to_string_lossy()),
-                    None => "Download finished.".to_string(),
+                    Some(name) => format!("{verb} {}", name.to_string_lossy()),
+                    None => "Finished.".to_string(),
                 }
+            } else if outcome.cancelled {
+                "Download stopped.".to_string()
             } else {
                 "That download failed.".to_string()
             };
@@ -1013,7 +1042,16 @@ impl App {
         match event {
             FetchEvent::Note(line) => view.notes.push(line),
             FetchEvent::Title(title) => view.title = Some(title),
-            FetchEvent::Stage(stage) => view.stage = stage,
+            FetchEvent::Stage(stage) => {
+                // The remux that follows a recording counts its own bytes from
+                // zero, and leaving the recording's total on screen would make
+                // the bar jump backwards from full.
+                if stage == Stage::Finishing && view.is_recording() {
+                    view.done = 0;
+                    view.total = None;
+                }
+                view.stage = stage;
+            }
             FetchEvent::Stream(n) => {
                 view.stream = n;
                 // A stream starting *is* the download starting - derived here
@@ -1032,6 +1070,7 @@ impl App {
                 view.rate = rate;
                 view.eta = eta;
             }
+            FetchEvent::Captured(seconds) => view.captured = Some(seconds),
             FetchEvent::Finished(_) => unreachable!("handled above"),
         }
     }

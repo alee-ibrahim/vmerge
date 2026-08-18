@@ -214,6 +214,49 @@ installed. Two things about it are worth knowing:
   `HTTP Error 403: Forbidden` and an error about streaming protocols that nobody
   could reasonably connect back to it.
 
+**A broadcast that is still on air is recorded, not downloaded.** Every link is
+asked what it is before a byte of it is fetched, because a live sitting has no
+last byte to wait for and finding that out afterwards is finding out too late.
+Left to the ordinary path it looks exactly like a hang: yt-dlp quietly hands live
+streams to ffmpeg and then reports nothing about them, so the screen sits at
+`got 0 KB` for as long as you leave it there while the file grows perfectly well
+underneath.
+
+A live link therefore gets its own screen and its own ending:
+
+```
+  RECORDING  LIVE                                                       37:14
+  ────────────────────────────────────────────────────────────────────────────
+  captured 1.4 GB   at 640 KB/s   elapsed 37:20   ends when you stop it
+
+  esc  finish the recording
+```
+
+There is no percentage and no estimate, because a broadcast has no end to be a
+fraction of and inventing one would be a bar telling a lie. What it shows instead
+is the running time in the file, which is a fact, and a marker travelling along
+the track so that a quiet stretch of a sitting cannot be mistaken for a stall.
+`esc` means *finish* here rather than *cancel*: everything captured is kept and
+written out, and the question it raises says so.
+
+Stopping is by ending ffmpeg, and the container is what makes that safe. ffmpeg
+will close a file tidily when sent a `q`, but only when its stdin is a console —
+given a pipe it never reads the keystroke, which was measured here rather than
+assumed: a `q` sent to a piped stdin was still being ignored a minute later. So
+the recording is written as an MPEG-TS stream, flushed packet by packet, and
+remuxed to `.mp4` afterwards without re-encoding a frame. A transport stream has
+no index to miss and is playable at every instant, so ending the process costs
+the packet in flight — and a crash, a power cut or a task manager leaves the
+sitting up to that point intact rather than a file of the right size that nothing
+can open. Writing straight to `.mp4` would have cost fifteen seconds of the
+ending, sitting unflushed in a buffer, which is what the first measured attempt
+did.
+
+Recording is copy-only for the same reason it has to be: re-encoding 1080p in
+real time is how a capture falls behind and loses the end of the sitting. A
+broadcast that has not started yet is refused with an explanation, and one that
+has already finished is an ordinary video and downloads the ordinary way.
+
 **YouTube needs a JavaScript engine.** It hands out video links behind a script
 puzzle, and yt-dlp has to run an engine to answer it. yt-dlp enables
 [Deno](https://deno.com) and nothing else by default, so a machine with Node.js
@@ -251,6 +294,21 @@ out, so stopping a download leaves nothing half-written behind — the same reas
 merges work in `_merge_temp` rather than in place. Best video and best audio
 usually arrive as two separate files, so the bar runs to 100% twice; the screen
 says which stream is arriving rather than letting that read as lost progress.
+
+**Stopping stops the whole tree.** Both children this program starts have one of
+their own — yt-dlp runs ffmpeg to join the video and audio streams, and a
+recording *is* ffmpeg — and Windows' `TerminateProcess` ends exactly one process.
+Stopping a download mid-join therefore used to leave an ffmpeg running, still
+writing and still holding the working folder open, so clearing that folder failed
+and a download the user had stopped carried on to the end. Children are put in a
+job object instead, which is how Windows expresses "these belong together", and
+the group ends in one call. It is set to die with this program too, so a crash
+does not orphan a recorder either.
+
+From the command line, `ctrl-c` asks the job to stop rather than killing the
+program where it stands, so a recording started with `--download` still gets its
+file written out. Press it twice and it is taken as meant: the default handler
+runs, and the job object takes ffmpeg down rather than leaving it behind.
 
 Playlists are not supported: a link that carries one alongside a video gets the
 video, and a bare playlist link gets its first entry.

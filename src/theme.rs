@@ -329,9 +329,53 @@ pub fn bar(fraction: f64, width: usize) -> String {
     out
 }
 
+/// A bar for work that is running but has no end to run to.
+///
+/// A live broadcast is the case this exists for: it lasts until the sitting
+/// finishes or the user stops it, so there is no fraction to draw and a bar
+/// drawn to one would be a lie. What this shows instead is that something is
+/// still happening - a short run of blocks travelling along the track, one cell
+/// per frame - and the timecode beside it carries the number that is real.
+pub fn sweep(phase: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    // Long enough to read as a moving object rather than a stray dot, and short
+    // enough that the track it is moving along is still obviously a track.
+    let run = (width / 6).clamp(2, 8);
+    // Travels its own length past the right edge before wrapping, so it slides
+    // off one end and back on at the other rather than jumping between them.
+    // Offset by one because a phase with nothing lit at all is a frame that
+    // reads as a hang - which is the very thing this is here to rule out.
+    let start = 1 + phase % (width + run - 1);
+
+    let mut out = String::with_capacity(width * 3);
+    for cell in 0..width {
+        // `start` counts from off the left edge, so the run enters gradually.
+        let lit = cell + run >= start && cell < start;
+        out.push_str(if lit { glyph::FULL } else { glyph::TRACK });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sweep_is_the_width_asked_for_and_always_moving() {
+        let mut seen = std::collections::HashSet::new();
+        for phase in 0..64 {
+            let drawn = sweep(phase, 20);
+            assert_eq!(drawn.chars().count(), 20, "phase {phase} drew the wrong width");
+            assert!(drawn.contains(glyph::FULL), "phase {phase} lit nothing at all");
+            seen.insert(drawn);
+        }
+        assert_eq!(sweep(7, 0), "", "no room is not a panic");
+        // The point of it is that it changes; one frozen frame would read as a
+        // hang, which is the very thing it is there to rule out.
+        assert!(seen.len() > 8, "the sweep has to actually travel");
+    }
 
     #[test]
     fn bars_are_the_width_they_are_asked_for() {

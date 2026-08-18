@@ -370,7 +370,9 @@ fn answer(app: &mut App, yes: bool) {
                 app.merge_next_to(&path);
             }
         }
-        Overlay::Confirm(Confirm::CancelMerge) | Overlay::Confirm(Confirm::CancelFetch) => {
+        Overlay::Confirm(Confirm::CancelMerge)
+        | Overlay::Confirm(Confirm::CancelFetch)
+        | Overlay::Confirm(Confirm::StopRecording) => {
             if yes {
                 app.confirm_cancel();
             } else {

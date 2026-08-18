@@ -965,6 +965,8 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
     // progress being lost.
     let label = match (view.stage, view.stream) {
         (Stage::Setup, _) => "SETTING UP".to_string(),
+        (Stage::Asking, _) => "CHECKING THE LINK".to_string(),
+        (Stage::Recording, _) => "RECORDING  LIVE".to_string(),
         (Stage::Finishing, _) => "PUTTING IT TOGETHER".to_string(),
         (_, 0 | 1) => "DOWNLOADING".to_string(),
         (_, n) => format!("DOWNLOADING  STREAM {n}"),
@@ -975,6 +977,30 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
     );
 
     let width = bar_line.width.saturating_sub(4) as usize;
+    // A broadcast still running has no end to be a fraction of, so what the bar
+    // carries instead is the one number that is real: how much is in the file.
+    // The sweep beside it is there to show the capture is still alive, which a
+    // timecode ticking once a second does not do on its own.
+    if view.is_recording() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{}  ", format::short_duration(view.captured.unwrap_or(0.0))),
+                theme.strong(),
+            ))
+            .alignment(Alignment::Right),
+            bar_label,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    theme::sweep(ui.frame / 2, width),
+                    Style::default().fg(theme.accent),
+                ),
+            ])),
+            bar_line,
+        );
+    } else {
     match view.fraction() {
         Some(fraction) => {
             frame.render_widget(
@@ -1002,8 +1028,12 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
             );
         }
     }
+    }
 
-    let mut stats = vec![Span::raw("  "), Span::styled("got ", theme.label())];
+    let mut stats = vec![
+        Span::raw("  "),
+        Span::styled(if view.is_recording() { "captured " } else { "got " }, theme.label()),
+    ];
     match view.total {
         Some(total) => stats.push(Span::styled(
             format!("{} / {}", format::size(view.done), format::size(total)),
@@ -1016,18 +1046,30 @@ fn draw_fetching(frame: &mut Frame, frame_area: Rect, view: &crate::app::FetchVi
         Span::styled(format::rate(view.rate), theme.dim()),
         Span::styled("   elapsed ", theme.label()),
         Span::styled(format::short_duration(view.elapsed()), theme.dim()),
-        Span::styled("   remaining ", theme.label()),
-        Span::styled(
-            view.eta.map(format::short_duration).unwrap_or_else(|| "estimating".into()),
-            theme.dim(),
-        ),
     ]);
+    if view.is_recording() {
+        // "Remaining" would be a fiction here, and the honest answer is the one
+        // worth the space: this does not stop until somebody stops it.
+        stats.extend([
+            Span::styled("   ends ", theme.label()),
+            Span::styled("when you stop it", theme.dim()),
+        ]);
+    } else {
+        stats.extend([
+            Span::styled("   remaining ", theme.label()),
+            Span::styled(
+                view.eta.map(format::short_duration).unwrap_or_else(|| "estimating".into()),
+                theme.dim(),
+            ),
+        ]);
+    }
     frame.render_widget(Paragraph::new(Line::from(stats)), timing);
 
     // Stopping stays on the keyboard, the same as the merge screen: a stray
     // click must not be able to throw away a download already half done.
     let ground = ui.theme.base;
-    hint_bar(frame, hints, ui, ground, &[&[nav("esc", "stop the download")]]);
+    let stop = if view.is_recording() { "finish the recording" } else { "stop the download" };
+    hint_bar(frame, hints, ui, ground, &[&[nav("esc", stop)]]);
 }
 
 // --------------------------------------------------------------------- result
@@ -1350,6 +1392,29 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, ui: &mut UiSta
             vec![
                 danger("y", "stop it", Click::Answer(true)),
                 hint("n", "keep going", Some(Click::Answer(false))),
+            ],
+        ),
+        Confirm::StopRecording => (
+            "Finish the recording?",
+            vec![
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Everything captured so far is kept and written out as a video.",
+                        theme.dim(),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "The rest of the broadcast is not recorded.",
+                        theme.dim(),
+                    ),
+                ]),
+            ],
+            vec![
+                hint("y", "finish it", Some(Click::Answer(true))),
+                hint("n", "keep recording", Some(Click::Answer(false))),
             ],
         ),
         Confirm::CancelFetch => (

@@ -142,6 +142,9 @@ fn every_overlay_renders() {
     app.overlay = Overlay::Confirm(Confirm::CancelFetch);
     assert!(render(&app, 100, 30).contains("STOP THE DOWNLOAD?"));
 
+    app.overlay = Overlay::Confirm(Confirm::StopRecording);
+    assert!(render(&app, 100, 30).contains("FINISH THE RECORDING?"));
+
     app.prompt_fetch();
     let screen = render(&app, 100, 30);
     assert!(screen.contains("DOWNLOAD A VIDEO"), "got:\n{screen}");
@@ -287,6 +290,93 @@ fn the_quiet_phases_of_a_download_still_say_what_they_are() {
     assert!(screen.contains("finishing off"), "got:\n{screen}");
 }
 
+/// A broadcast still on air is a different job from a download, and the screen
+/// has to say so. There is no total to be a fraction of and no arrival to wait
+/// for, so what it shows instead is how much is captured and the fact that this
+/// carries on until somebody stops it.
+#[test]
+fn a_live_broadcast_says_it_is_live_and_that_it_runs_until_stopped() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/watch?v=abc".into()));
+
+    app.handle_event(AppEvent::Fetch(FetchEvent::Title("26th Sitting".into())));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Note(
+        "This is live. It will keep recording until the broadcast ends or you stop it.".into(),
+    )));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Recording)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Captured(754.0)));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
+        done: 96 * 1024 * 1024,
+        total: None,
+        rate: 130.0 * 1024.0,
+        eta: None,
+    }));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("26th Sitting"), "got:\n{screen}");
+    assert!(screen.contains("RECORDING  LIVE"), "got:\n{screen}");
+    assert!(screen.contains("This is live"), "the note explains itself:\n{screen}");
+    // The timecode is the real measure of a recording, and the sweep beside it
+    // is what shows the capture is still running.
+    assert!(screen.contains("12:34"), "expected the captured length:\n{screen}");
+    assert!(screen.contains('█'), "expected the moving bar:\n{screen}");
+    assert!(screen.contains("captured"), "got:\n{screen}");
+    assert!(screen.contains("96.0 MB"), "got:\n{screen}");
+    // Never a percentage and never an estimate: a broadcast has no end to
+    // measure against, and inventing one would be a lie the bar tells.
+    assert!(!screen.contains('%'), "a live capture has no percentage:\n{screen}");
+    assert!(!screen.contains("estimating"), "got:\n{screen}");
+    assert!(screen.contains("when you stop it"), "got:\n{screen}");
+    // Stopping a recording keeps it, so esc cannot be labelled as throwing it
+    // away the way it is on a download.
+    assert!(screen.contains("finish the recording"), "got:\n{screen}");
+}
+
+/// Stopping is how a recording is meant to end, so the question esc raises has
+/// to promise what it actually does - which is the opposite of what stopping a
+/// download promises.
+#[test]
+fn stopping_a_recording_offers_to_keep_it() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/v".into()));
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Recording)));
+
+    app.request_cancel();
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("FINISH THE RECORDING?"), "got:\n{screen}");
+    assert!(screen.contains("is kept"), "got:\n{screen}");
+    assert!(screen.contains("keep recording"), "got:\n{screen}");
+
+    // A download in the same place still promises the opposite, because that is
+    // still what it does.
+    app.close_overlay();
+    app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Downloading)));
+    app.request_cancel();
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("STOP THE DOWNLOAD?"), "got:\n{screen}");
+    assert!(screen.contains("thrown away"), "got:\n{screen}");
+}
+
+/// A recording that the user stopped produced exactly what it was asked for.
+/// Reporting that as a cancelled download would call a successful capture a
+/// loss, which is the one thing the report must not do.
+#[test]
+fn a_stopped_recording_is_reported_as_a_file_and_not_as_a_loss() {
+    let (mut app, _rx) = app_with(vec![]);
+    app.screen = Screen::Fetching(FetchView::new("https://example.com/v".into()));
+
+    let mut done = outcome(true);
+    done.recorded = true;
+    done.cancelled = true;
+    done.output = PathBuf::from("C:/clips/26th Sitting.mp4");
+    app.handle_event(AppEvent::Fetch(FetchEvent::Finished(Box::new(done))));
+
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("DONE"), "got:\n{screen}");
+    assert!(screen.contains("26th Sitting.mp4"), "got:\n{screen}");
+    assert!(app.status.iter().any(|(text, _)| text.contains("Recorded")), "got {:?}", app.status);
+}
+
 /// A download reports through the same screen a merge does, so a file that
 /// arrived from a link reads exactly like one that was built here.
 #[test]
@@ -385,6 +475,7 @@ fn outcome(ok: bool) -> Outcome {
         warnings: Vec::new(),
         error: if ok { None } else { Some("ffmpeg said no".into()) },
         cancelled: false,
+        recorded: false,
     }
 }
 
