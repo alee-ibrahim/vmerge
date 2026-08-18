@@ -178,13 +178,22 @@ MERGE-VIDEOS.exe --download "https://www.youtube.com/watch?v=..." --download-qua
 | Choice | Gets |
 | --- | --- |
 | `best` | whatever the site has, at the highest resolution |
-| `1080p` `720p` `480p` | a hard cap, not a preference — 720p means 720p |
+| `2160p` (`4k`) `1080p` `720p` `480p` | a hard cap, not a preference — 720p means 720p |
 | `audio` | an `.m4a`, no picture |
 
 Anything but `audio` arrives as an `.mp4`, preferring H.264 and AAC within the
 resolution you asked for — which is exactly what the merge side then joins
 without re-encoding anything. Resolution is still the first thing sorted on, or
 a 360p H.264 stream would beat a 1080p VP9 one and the cap would mean nothing.
+
+**Above 1080p there is no H.264.** YouTube publishes 1440p and 2160p in VP9 and
+AV1 only, so `4k` cannot arrive in the codec the rest of this program prefers. It
+still arrives as a perfectly good `.mp4` — VP9 in MP4 is legal and plays — but
+joining it to anything means re-encoding it, which is the one cost the format
+sorting exists to avoid. That is a fair trade for an archive copy and a poor one
+for footage about to be merged, so it is a choice rather than a default, and it
+says as much in the picker. `best` has always crossed the same line silently
+whenever a video went above 1080p; `4k` is the same reach, named.
 
 The work is done by [yt-dlp](https://github.com/yt-dlp/yt-dlp), which covers
 YouTube and around 1800 other sites and uses the ffmpeg this program already
@@ -405,7 +414,7 @@ MERGE-VIDEOS.exe --no-tui a.mp4 b.mp4 --quality small --encoder cpu
 | `--encoder` | `auto` \| `cpu` \| `nvenc` \| `qsv` \| `amf` |
 | `--force-reencode` | re-encode even when clips already match |
 | `--download <url>` | download that one video and stop; nothing is merged |
-| `--download-quality` | `best` \| `1080p` \| `720p` \| `480p` \| `audio` |
+| `--download-quality` | `best` \| `2160p` \| `1080p` \| `720p` \| `480p` \| `audio` |
 | `--skip-ffmpeg-download` | fail instead of downloading ffmpeg |
 | `--skip-ytdlp-download` | fail instead of downloading yt-dlp |
 | `--no-update` | do not look for a newer version on start |

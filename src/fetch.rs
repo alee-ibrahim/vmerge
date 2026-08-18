@@ -103,6 +103,10 @@ const PART: &str = ".part";
 pub enum FetchQuality {
     /// Whatever the site has, at the highest resolution.
     Best,
+    /// 4K, where the site has it. Nothing above 1080p is published in H.264,
+    /// so this arrives as VP9 and joining it to anything re-encodes it.
+    #[value(name = "2160p", alias = "4k")]
+    P2160,
     #[value(name = "1080p")]
     P1080,
     #[value(name = "720p")]
@@ -114,8 +118,9 @@ pub enum FetchQuality {
 }
 
 impl FetchQuality {
-    pub const ALL: [FetchQuality; 5] = [
+    pub const ALL: [FetchQuality; 6] = [
         FetchQuality::Best,
+        FetchQuality::P2160,
         FetchQuality::P1080,
         FetchQuality::P720,
         FetchQuality::P480,
@@ -125,6 +130,7 @@ impl FetchQuality {
     pub fn label(self) -> &'static str {
         match self {
             FetchQuality::Best => "best available",
+            FetchQuality::P2160 => "4K",
             FetchQuality::P1080 => "1080p",
             FetchQuality::P720 => "720p",
             FetchQuality::P480 => "480p",
@@ -136,6 +142,7 @@ impl FetchQuality {
     pub fn note(self) -> &'static str {
         match self {
             FetchQuality::Best => "biggest file, slowest download",
+            FetchQuality::P2160 => "if the source has it; slow to merge after",
             FetchQuality::P1080 => "the sensible default",
             FetchQuality::P720 => "smaller, still sharp",
             FetchQuality::P480 => "smallest, quickest",
@@ -149,6 +156,7 @@ impl FetchQuality {
     fn selector(self) -> &'static str {
         match self {
             FetchQuality::Best => "bv*+ba/b",
+            FetchQuality::P2160 => "bv*[height<=2160]+ba/b[height<=2160]",
             FetchQuality::P1080 => "bv*[height<=1080]+ba/b[height<=1080]",
             FetchQuality::P720 => "bv*[height<=720]+ba/b[height<=720]",
             FetchQuality::P480 => "bv*[height<=480]+ba/b[height<=480]",
@@ -450,6 +458,12 @@ fn attempt(
 /// Resolution first, or this would happily prefer a 360p H.264 stream over a
 /// 1080p VP9 one. Within a resolution, H.264 in an mp4 is what the merge side of
 /// this program joins without re-encoding anything.
+///
+/// Which is also why the named resolutions stop at 1080p: YouTube publishes no
+/// H.264 above it. Ask for more and what arrives is necessarily VP9 or AV1 -
+/// a perfectly good file, in a perfectly good mp4, that the merge side then has
+/// to re-encode to join. That is a real cost and belongs to whoever chose it,
+/// so 4K is offered by name rather than only reachable by picking "best".
 const SORT: &str = "res,vcodec:h264,acodec:aac,ext:mp4:m4a";
 
 /// The arguments that decide *which* stream is wanted.
@@ -1569,6 +1583,31 @@ mod tests {
         // 4K whenever the site happened to offer it.
         assert!(FetchQuality::P720.selector().contains("height<=720"));
         assert!(!FetchQuality::Best.selector().contains("height"));
+
+        // Every named resolution is a cap of its own name, and they descend, so
+        // asking for less can never come back with more.
+        let caps: Vec<u32> = FetchQuality::ALL
+            .iter()
+            .filter_map(|q| {
+                let s = q.selector();
+                let at = s.find("height<=")? + "height<=".len();
+                s[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+            })
+            .collect();
+        assert_eq!(caps, [2160, 1080, 720, 480], "got {caps:?}");
+    }
+
+    /// 4K exists to be asked for by name. It was always reachable through "best
+    /// available", which is not the same as being offered.
+    #[test]
+    fn four_k_is_offered_by_name() {
+        assert!(FetchQuality::ALL.contains(&FetchQuality::P2160));
+        assert_eq!(FetchQuality::P2160.label(), "4K");
+        assert!(FetchQuality::P2160.selector().contains("height<=2160"));
+        assert!(!FetchQuality::P2160.is_audio());
+        // It is the second choice, right below "best": the list reads downwards
+        // from most to least, and a resolution out of order would be a trap.
+        assert_eq!(FetchQuality::ALL[1], FetchQuality::P2160);
     }
 
     #[test]

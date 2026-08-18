@@ -606,7 +606,8 @@ impl App {
         self.overlay = Overlay::Menu(Menu {
             kind: MenuKind::Fetch,
             title: "How much of it".into(),
-            note: "Bigger takes longer to fetch. Anything but audio arrives as an mp4."
+            note: "Bigger takes longer to fetch. Above 1080p there is no H.264, so those \
+                   arrive as VP9 and joining one re-encodes it."
                 .into(),
             items,
             cursor,

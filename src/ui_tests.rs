@@ -165,9 +165,21 @@ fn a_link_opens_the_stream_picker_and_a_path_does_not() {
 
     let screen = render(&app, 100, 30);
     assert!(screen.contains("HOW MUCH OF IT"), "got:\n{screen}");
-    for choice in ["best available", "1080p", "720p", "480p", "audio only"] {
+    for choice in ["best available", "4K", "1080p", "720p", "480p", "audio only"] {
         assert!(screen.contains(choice), "{choice:?} has to be offered:\n{screen}");
     }
+
+    // The picker is a fixed 72 columns and its rows do not wrap, so a note one
+    // word too long is silently cut in half. What going above 1080p costs is the
+    // whole reason 4K is named rather than left to "best available", so that is
+    // the line which must survive being drawn.
+    assert!(screen.contains("no H.264"), "the caveat has to be there:
+{screen}");
+    assert!(screen.contains("re-encodes it"), "and must not be cut off:
+{screen}");
+    // Numbered downwards from most to least, so pressing 2 gets 4K.
+    let row = screen.lines().find(|l| l.contains("4K")).expect("a 4K row");
+    assert!(row.contains(" 2 "), "4K has to be the second choice: {row:?}");
 
     // A dropped clip is not a link, and must not start a download.
     app.close_overlay();
