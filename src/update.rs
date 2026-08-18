@@ -252,6 +252,22 @@ fn previous_path(exe: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Where the running image can be moved to, best first.
+///
+/// The plain `.previous` is the name to use, and it is also the name that gets
+/// stuck: another copy of the program started before the last update is still
+/// running from that image, so it can be neither deleted nor written over, and
+/// every update from then on fails at the same step - which is exactly what
+/// happened here, silently, for two versions in a row.
+///
+/// One live process can hold one name. The fallback carries this process's id, so
+/// there is always a free name to move aside to, and the sweep clears both.
+fn aside_paths(exe: &Path) -> Vec<PathBuf> {
+    let mut name = exe.as_os_str().to_owned();
+    name.push(format!("{PREVIOUS}-{}", std::process::id()));
+    vec![previous_path(exe), PathBuf::from(name)]
+}
+
 /// Clears up after an earlier update, whatever this run is going to do.
 ///
 /// Deliberately not part of `run`: leaving a hidden copy of a previous version
@@ -276,10 +292,17 @@ fn sweep(dir: &Path, exe_name: &OsStr) {
         name.push(PREVIOUS);
         name
     };
+    // Starts with rather than equals: an update that could not have the plain
+    // `.previous` moved the image aside under a name carrying its process id, and
+    // that copy needs sweeping just as much.
+    let stale_prefix = stale_image.to_str().map(str::to_owned);
     for entry in entries.flatten() {
         let name = entry.file_name();
         let ours = name == stale_image
-            || name.to_str().is_some_and(|text| text.starts_with(STAGING));
+            || name.to_str().is_some_and(|text| {
+                text.starts_with(STAGING)
+                    || stale_prefix.as_deref().is_some_and(|stale| text.starts_with(stale))
+            });
         // Best effort throughout: another copy of the program may still be
         // running from one of these, and then the delete simply fails.
         if ours {
@@ -353,6 +376,11 @@ pub enum Outcome {
     /// A newer build is now under this executable's name. This process is still
     /// the old image, so the caller hands over to it.
     Replaced(Version),
+    /// A newer version exists and could not be installed. Carried out of here
+    /// rather than only printed, because on the interactive path the console line
+    /// saying so is wiped by the full-screen UI a moment later - which is how two
+    /// versions' worth of failed updates went unnoticed.
+    Failed(Version),
 }
 
 /// Looks for a newer release and installs it.
@@ -388,7 +416,7 @@ pub fn run(reporter: &mut dyn Reporter) -> Outcome {
             reporter.finished();
             reporter.log(&format!("The update did not finish ({error:#})."));
             reporter.log(&format!("Carrying on with {here}. Nothing was changed."));
-            Outcome::UpToDate
+            Outcome::Failed(latest.version)
         }
     }
 }
@@ -467,22 +495,29 @@ fn fetch_asset(
 
 /// Puts `staged` under the running executable's name.
 fn swap_in(exe: &Path, staged: &Path) -> Result<()> {
-    let previous = previous_path(exe);
-    // Left over from an update that has since been restarted, so nothing is
-    // running from it any more.
-    let _ = fs::remove_file(&previous);
+    let mut last = None;
+    for previous in aside_paths(exe) {
+        // Left over from an update that has since been restarted, in which case
+        // nothing is running from it any more - or still in use by a copy that has
+        // not been closed, in which case this fails and so does the rename, and the
+        // next name along is tried instead.
+        let _ = fs::remove_file(&previous);
+        if let Err(error) = fs::rename(exe, &previous) {
+            last = Some(error);
+            continue;
+        }
+        proc::set_hidden(&previous);
 
-    fs::rename(exe, &previous)
-        .with_context(|| format!("moving {} out of the way", exe.display()))?;
-    proc::set_hidden(&previous);
-
-    if let Err(error) = fs::rename(staged, exe) {
-        // Put the working copy back rather than leave the folder with no
-        // executable in it at all.
-        let _ = fs::rename(&previous, exe);
-        return Err(error).with_context(|| format!("installing the new {}", exe.display()));
+        if let Err(error) = fs::rename(staged, exe) {
+            // Put the working copy back rather than leave the folder with no
+            // executable in it at all.
+            let _ = fs::rename(&previous, exe);
+            return Err(error).with_context(|| format!("installing the new {}", exe.display()));
+        }
+        return Ok(());
     }
-    Ok(())
+    Err(last.unwrap_or_else(|| std::io::Error::other("no name to move the old version to")))
+        .with_context(|| format!("moving {} out of the way", exe.display()))
 }
 
 /// Runs the newly installed executable with the arguments this one was given,
@@ -682,6 +717,38 @@ mod tests {
         }
     }
 
+    /// The failure that went unnoticed for two versions: another copy of the
+    /// program, started before the last update, is still running from
+    /// `MERGE-VIDEOS.exe.previous`. That name can then be neither deleted nor
+    /// written over, and every update from then on dies at the same step. There has
+    /// to be a second name to move aside to.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_stuck_previous_image_does_not_block_the_update() {
+        let dir = std::env::temp_dir().join(format!("vmerge-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("MERGE-VIDEOS.exe");
+        let staged = dir.join(format!("{STAGING}test.exe"));
+        fs::write(&exe, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        // A held handle is what makes the name unusable on Windows. Nothing here
+        // can hold one portably, so the same corner is reached by making the plain
+        // name impossible to take: a directory cannot be deleted as a file, and
+        // cannot be renamed over either.
+        fs::create_dir(previous_path(&exe)).unwrap();
+
+        swap_in(&exe, &staged).expect("the update must not be stopped by a stuck name");
+
+        assert_eq!(fs::read(&exe).unwrap(), b"new", "the new version is installed");
+        assert!(!staged.exists(), "and the staged copy is gone, not left lying about");
+        let aside = aside_paths(&exe)[1].clone();
+        assert_eq!(fs::read(&aside).unwrap(), b"old", "the old one is beside it, out of the way");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_image_moved_aside_keeps_the_name_it_can_be_swept_by() {
         let previous = previous_path(Path::new("C:/tools/MERGE-VIDEOS.exe"));
@@ -693,6 +760,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let files = [
             "MERGE-VIDEOS.exe.previous",
+            "MERGE-VIDEOS.exe.previous-4242",
             &format!("{STAGING}1234.exe"),
             "MERGE-VIDEOS.exe",
             "clip.mp4",
@@ -704,6 +772,10 @@ mod tests {
         sweep(&dir, OsStr::new("MERGE-VIDEOS.exe"));
 
         assert!(!dir.join("MERGE-VIDEOS.exe.previous").exists(), "the old image goes");
+        assert!(
+            !dir.join("MERGE-VIDEOS.exe.previous-4242").exists(),
+            "and so does one moved aside under a name carrying a process id"
+        );
         assert!(!dir.join(format!("{STAGING}1234.exe")).exists(), "so does a stale download");
         assert!(dir.join("MERGE-VIDEOS.exe").exists(), "the program itself stays");
         assert!(dir.join("clip.mp4").exists(), "and so does everything else");

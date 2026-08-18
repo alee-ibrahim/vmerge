@@ -171,13 +171,27 @@ fn real_main(args: Args) -> Result<bool> {
     // started that could be lost, and whatever work this run turns out to
     // involve - including a first-time ffmpeg download - should be done by the
     // newer build rather than by this one.
-    if update_wanted(&args) && let update::Outcome::Replaced(version) = update::run(&mut reporter) {
-        reporter.log(&format!("Updated to {version}. Starting it now."));
-        let code = update::relaunch()?;
-        // Nothing left for this process to do: the new version has run to
-        // completion, said whatever it had to say, and paused if it needed to.
-        let _ = io::stdout().flush();
-        std::process::exit(code);
+    //
+    // An update that could not be installed is carried forward rather than only
+    // printed: on the interactive path the console is wiped by the full-screen UI
+    // a second later, so the line saying so was never read - which is how a
+    // machine sat on an old version through two releases while the new one was
+    // being downloaded and thrown away on every start.
+    let mut stale_version = None;
+    if update_wanted(&args) {
+        match update::run(&mut reporter) {
+            update::Outcome::Replaced(version) => {
+                reporter.log(&format!("Updated to {version}. Starting it now."));
+                let code = update::relaunch()?;
+                // Nothing left for this process to do: the new version has run to
+                // completion, said whatever it had to say, and paused if it needed
+                // to.
+                let _ = io::stdout().flush();
+                std::process::exit(code);
+            }
+            update::Outcome::Failed(version) => stale_version = Some(version),
+            update::Outcome::UpToDate => {}
+        }
     }
 
     let exe_dir = std::env::current_exe()
@@ -275,7 +289,7 @@ fn real_main(args: Args) -> Result<bool> {
         );
     }
 
-    run_tui(tools, root, exe_dir, search, files, &args)
+    run_tui(tools, root, exe_dir, search, files, &args, stale_version)
 }
 
 /// Setup progress on the plain console, before the interactive screen exists.
@@ -414,6 +428,7 @@ fn read_file_list(path: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     tools: Arc<ffmpeg::Tools>,
     root: PathBuf,
@@ -421,6 +436,7 @@ fn run_tui(
     search: Vec<PathBuf>,
     files: Vec<PathBuf>,
     args: &Args,
+    stale_version: Option<update::Version>,
 ) -> Result<bool> {
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(tools, root.clone(), tx);
@@ -451,6 +467,19 @@ fn run_tui(
     // was wrong anyway.
     if !files.is_empty() {
         app.add_paths(files.iter().map(|f| f.display().to_string()).collect());
+    }
+
+    // Said on the screen the user is actually looking at. The reason is on the
+    // console above, where there is room for a path and an error; what belongs
+    // here is which version this is and the one thing that usually fixes it.
+    if let Some(version) = stale_version {
+        app.say(
+            format!(
+                "Version {version} could not be installed - this is still {}.                  Close any other copy and start again.",
+                env!("CARGO_PKG_VERSION")
+            ),
+            app::Kind::Warn,
+        );
     }
 
     let mut terminal = ratatui::init();

@@ -440,6 +440,21 @@ What makes that safe enough to do without asking:
   folder that cannot be written: all of them leave the running exe exactly as it
   was, and the merge you actually came to do goes ahead. An update that does not
   happen is never the reason something else did not happen.
+- **Failing says so where you are looking.** A failed update prints its reason to
+  the console, which on the interactive path is wiped by the full-screen UI a
+  second later — so the list screen carries a line of its own saying which version
+  could not be installed and which one this still is. Without it the failure is
+  invisible: a machine here sat on 0.1.7 through two releases, downloading the new
+  build and throwing it away on every single start, and nothing on screen said so.
+
+The swap itself is the Windows rename trick — a running image cannot be
+overwritten, but it can be renamed out of the way, which frees its name for the
+new one. The catch is that the name it is renamed *to* can itself be in use: open
+a second copy of the program, update, and that second copy is now running from
+`MERGE-VIDEOS.exe.previous`, which can then be neither deleted nor renamed over.
+That was the two-release failure above. The image is now moved aside under a name
+carrying the process id when the plain one is stuck, so one live copy can no
+longer hold the updater hostage, and the sweep clears both forms on a later start.
 
 Turn it off with `--no-update`, or by setting `VMERGE_NO_UPDATE` to anything.
 Debug builds never update — replacing the build you are testing with a released
@@ -644,7 +659,7 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-131 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+132 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
 what blocks the fast path) are covered directly, as are the conversion rules
 (which container takes which codec as it is, which format needs which encoder,
 that mp4 to mp4 never hands ffmpeg the file it is reading), and every screen and
