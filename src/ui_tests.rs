@@ -27,6 +27,8 @@ fn clip(name: &str, w: u32, h: u32, fps: f64, secs: f64) -> ClipInfo {
         width: w,
         height: h,
         pix_fmt: "yuv420p".into(),
+        sample_aspect_raw: "1:1".into(),
+        pixel_aspect: 1.0,
         fps,
         frame_rate_raw: "30/1".into(),
         rotation: 0,

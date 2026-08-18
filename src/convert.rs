@@ -488,7 +488,12 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
             Some(info) => {
                 outcome.out_duration = info.duration;
                 if info.has_video {
-                    outcome.out_format = Some((info.width, info.height, info.fps));
+                    // The size it will be displayed at, which for anamorphic footage is
+                    // not the size in the file - and is what the plan line promised.
+                    outcome.out_format = {
+                        let (width, height) = info.display_size();
+                        Some((width, height, info.fps))
+                    };
                 }
             }
             None => outcome.out_duration = probe::duration_of(&job.tools.ffprobe, &written[0]),
@@ -596,10 +601,16 @@ fn encode_args(
         // clip; two passes over the same decode - a palette built from these
         // frames, then applied to them - is the difference between a gradient and
         // a poster.
+        // Both sides of the scale are worked out from `sar` and `dar` - the shape
+        // of a stored pixel and the ratio the clip is displayed at - because a GIF
+        // has nowhere to record a pixel shape. Anamorphic footage has to be
+        // stretched here or not at all, and 350x572 with 24:11 pixels written out
+        // by its stored numbers is a third of the width it should be.
         args.extend([
             "-filter_complex".to_string(),
             format!(
-                "fps={GIF_FPS},scale=w='min({GIF_WIDTH}\\,iw)':h=-1:flags=lanczos,\
+                "fps={GIF_FPS},scale=w='min({GIF_WIDTH}\\,iw*sar)':h='min({GIF_WIDTH}\\,iw*sar)/dar':\
+                 flags=lanczos,setsar=1,\
                  split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer"
             ),
             "-an".into(),
@@ -734,6 +745,8 @@ mod tests {
             width: 1920,
             height: 1080,
             pix_fmt: "yuv420p".into(),
+            sample_aspect_raw: "1:1".into(),
+            pixel_aspect: 1.0,
             fps: 30.0,
             frame_rate_raw: "30/1".into(),
             rotation: 0,
@@ -827,7 +840,12 @@ mod tests {
         assert!(filter.contains(&format!("fps={GIF_FPS}")), "{filter}");
         // The comma inside min() has to be escaped, or ffmpeg reads it as the end
         // of the scale filter and the chain falls apart.
-        assert!(filter.contains("min(640\\,iw)"), "{filter}");
+        assert!(filter.contains("min(640\\,iw*sar)"), "{filter}");
+        // A GIF has nowhere to record a pixel shape, so anamorphic footage is
+        // stretched here or it comes out squeezed: both sides of the scale are read
+        // through sar and dar.
+        assert!(filter.contains("/dar"), "{filter}");
+        assert!(filter.contains("setsar=1"), "{filter}");
         assert!(args.contains(&"-an".to_string()), "a GIF has no sound: {args:?}");
         assert!(args.windows(2).any(|w| w == ["-loop", "0"]), "and it loops: {args:?}");
     }

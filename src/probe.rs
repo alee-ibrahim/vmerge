@@ -19,6 +19,13 @@ pub struct ClipInfo {
     pub width: u32,
     pub height: u32,
     pub pix_fmt: String,
+    /// The shape of one stored pixel, as ffprobe reports it - "24:11" for the
+    /// anamorphic footage a lot of broadcast material still is. Kept verbatim for
+    /// the strict "are these two identical" test.
+    pub sample_aspect_raw: String,
+    /// The same thing as a number: how much wider a stored pixel is than it is
+    /// tall. 1.0 for the square pixels nearly everything modern uses.
+    pub pixel_aspect: f64,
     /// The rate to use for decisions and display.
     pub fps: f64,
     /// r_frame_rate verbatim, kept only for the strict "are these identical" check.
@@ -37,11 +44,52 @@ impl ClipInfo {
         if self.has_audio { &self.audio_codec } else { "silent" }
     }
 
+    /// The pixel shape as a pair of whole numbers, the way ffprobe reported it and
+    /// the way ffmpeg's `setsar` wants it back. `(1, 1)` for anything square,
+    /// unmeasured or absurd.
+    pub fn pixel_shape(&self) -> (u32, u32) {
+        let parsed = self.sample_aspect_raw.trim().split_once(':').and_then(|(n, d)| {
+            let n: u32 = n.trim().parse().ok()?;
+            let d: u32 = d.trim().parse().ok()?;
+            (n > 0 && d > 0).then_some((n, d))
+        });
+        match parsed {
+            // The same bounds the ratio itself is held to, so the two cannot
+            // disagree about what counts as footage.
+            Some((n, d)) if self.pixel_aspect > 0.0 && (n as f64 / d as f64 - self.pixel_aspect).abs() < 1e-9 => (n, d),
+            _ => (1, 1),
+        }
+    }
+
+    /// The size a player actually shows, which for anamorphic footage is not the
+    /// size in the file: 350x572 stored with 24:11 pixels is a 764x572 picture.
+    ///
+    /// Widening rather than shortening whenever the pixels are wide than tall, and
+    /// the other way round when they are taller: correcting the shape must never
+    /// be an excuse to throw lines away.
+    pub fn display_size(&self) -> (u32, u32) {
+        if !self.has_video {
+            return (0, 0);
+        }
+        let even = |v: f64| {
+            let v = v.round().max(2.0) as u32;
+            v + v % 2
+        };
+        if self.pixel_aspect >= 1.0 {
+            (even(self.width as f64 * self.pixel_aspect), self.height)
+        } else {
+            (self.width, even(self.height as f64 / self.pixel_aspect))
+        }
+    }
+
+    /// The size on screen, which is the one worth showing: it is what the clip
+    /// looks like, what the merge targets, and what a player will report.
     pub fn dimensions(&self) -> String {
         if !self.has_video {
             return crate::theme::glyph::NONE.to_string();
         }
-        format!("{}{}{}", self.width, crate::theme::glyph::TIMES, self.height)
+        let (width, height) = self.display_size();
+        format!("{width}{}{height}", crate::theme::glyph::TIMES)
     }
 
     /// The framerate column. A file with no picture has no framerate, and a "0"
@@ -79,6 +127,7 @@ struct ProbeStream {
     pix_fmt: Option<String>,
     r_frame_rate: Option<String>,
     avg_frame_rate: Option<String>,
+    sample_aspect_ratio: Option<String>,
     /// ffprobe reports this as a JSON string, not a number.
     sample_rate: Option<String>,
     channels: Option<u32>,
@@ -108,6 +157,23 @@ fn parse_rational(text: &str) -> f64 {
     let num: f64 = num.trim().parse().unwrap_or(0.0);
     let den: f64 = den.trim().parse().unwrap_or(0.0);
     if den == 0.0 { 0.0 } else { num / den }
+}
+
+/// "24:11" -> 2.18. Anything missing, unmeasured ("0:1") or nonsensical means
+/// square pixels, which is the only safe assumption: treating an unknown shape as
+/// a stretch would distort footage that was never anamorphic.
+fn parse_aspect(text: &str) -> f64 {
+    let Some((num, den)) = text.trim().split_once(':') else {
+        return 1.0;
+    };
+    let num: f64 = num.trim().parse().unwrap_or(0.0);
+    let den: f64 = den.trim().parse().unwrap_or(0.0);
+    if num <= 0.0 || den <= 0.0 {
+        return 1.0;
+    }
+    let ratio = num / den;
+    // A pixel eight times wider than it is tall is a misread field, not footage.
+    if (0.125..=8.0).contains(&ratio) { ratio } else { 1.0 }
 }
 
 /// Reads one file's format. Returns None for anything with neither a video nor
@@ -178,8 +244,14 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
 
     let mut width = video.and_then(|v| v.width).unwrap_or(0);
     let mut height = video.and_then(|v| v.height).unwrap_or(0);
+    let sample_aspect_raw =
+        video.and_then(|v| v.sample_aspect_ratio.clone()).unwrap_or_default();
+    let mut pixel_aspect = parse_aspect(&sample_aspect_raw);
     if rotation == 90 || rotation == 270 {
         std::mem::swap(&mut width, &mut height);
+        // Turning the frame a quarter turn turns the pixels with it: what was
+        // wide is now tall.
+        pixel_aspect = 1.0 / pixel_aspect;
     }
 
     let duration = data
@@ -202,6 +274,8 @@ pub fn clip_info(ffprobe: &Path, path: &Path) -> Option<ClipInfo> {
         width,
         height,
         pix_fmt: video.and_then(|v| v.pix_fmt.clone()).unwrap_or_default(),
+        sample_aspect_raw,
+        pixel_aspect,
         // A file with no picture has no framerate either, and the fallback of 30
         // above would put an invented one on screen.
         fps: if video.is_some() { (effective_fps * 1000.0).round() / 1000.0 } else { 0.0 },
@@ -248,6 +322,18 @@ pub fn duration_of(ffprobe: &Path, path: &Path) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_shapes() {
+        assert!((parse_aspect("24:11") - 24.0 / 11.0).abs() < 1e-9);
+        assert_eq!(parse_aspect("1:1"), 1.0);
+        // ffprobe says 0:1 when it has not measured one, and nothing at all for
+        // a stream that has none.
+        assert_eq!(parse_aspect("0:1"), 1.0);
+        assert_eq!(parse_aspect(""), 1.0);
+        assert_eq!(parse_aspect("N/A"), 1.0);
+        assert_eq!(parse_aspect("99:1"), 1.0, "a misread field, not footage");
+    }
 
     #[test]
     fn rationals() {

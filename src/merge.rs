@@ -223,7 +223,12 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(MergeEvent)) -> 
             outcome.size = fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
             if let Some(info) = probe::clip_info(&job.tools.ffprobe, &output) {
                 outcome.out_duration = info.duration;
-                outcome.out_format = Some((info.width, info.height, info.fps));
+                // The size it will be displayed at, which for anamorphic footage is
+                // not the size in the file - and is what the plan line promised.
+                outcome.out_format = {
+                    let (width, height) = info.display_size();
+                    Some((width, height, info.fps))
+                };
                 // Inputs adding up to more than the output means clips were
                 // dropped or a join went wrong - worth saying out loud.
                 let slack = (expected_duration * 0.02).max(2.0);

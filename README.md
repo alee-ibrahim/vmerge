@@ -387,7 +387,9 @@ newer, so H.264 into AVI re-encodes to MPEG-4 rather than copying and calling it
 converted.
 
 Nothing is resized or re-timed: the picture comes out the size it went in, with
-every frame still there. GIF is the one exception — it is a still-image format
+every frame still there — anamorphic footage included, since the pixel shape
+travels with the streams into the new container (and is re-derived when a
+re-encode is needed). GIF is the one exception — it is a still-image format
 pressed into service as video, so 12 fps at 640 wide is the difference between a
 file you can post and one you cannot — and the picker says so before you pick it.
 
@@ -549,6 +551,28 @@ knowledge lives:
   format to ffmpeg, and treating them as such costs a needless re-encode.
 - **Rotation is tracked.** A portrait phone clip reports 1920x1080 plus
   `rotate:90`, and must not be treated as identical to an unrotated clip.
+- **The pixel shape is part of the format.** Plenty of broadcast footage is
+  anamorphic: it stores a 350x574 frame of pixels that are 24:11 — wider than they
+  are tall — which a player stretches into the 764x574 picture you actually see.
+  Sizes are therefore weighted, targeted, offered and displayed as what is on
+  screen, never as what is in the file, and two clips count as identical only if
+  their pixels are the same shape as well as the same number.
+
+  Where every clip already shares one pixel shape, the target keeps it and encodes
+  at the stored size — 350 wide rather than upscaled to 764, which is a third fewer
+  pixels per row and not one pixel more detail. Only a *mixed* set is normalised
+  to square pixels, because that is the one shape a stretched clip and an
+  unstretched one can both be brought to. A size you type in by hand is a size on
+  screen, so it means square pixels too.
+
+  This is what "the resolution goes cramped after a merge" was: the target was
+  read off the stored numbers, `force_original_aspect_ratio=decrease` fitted the
+  stored frame rather than the picture, and the `setsar=1` after it threw away the
+  stretch that would have put it right — so 764x574 of 4:3 footage came out as
+  350x572 squeezed into a third of its width. The fit is now worked out from `dar`,
+  the ratio the clip is displayed at, and the target's own pixel shape is written
+  back out. GIF is the one format that cannot record a pixel shape, so a conversion
+  to one stretches the frame instead.
 - **Silent clips get a generated audio track**, or the join desyncs.
 
 ### And what a conversion does instead
@@ -620,7 +644,7 @@ cargo test
 cargo test dump_screens -- --ignored --nocapture   # print the screens
 ```
 
-126 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
+131 tests. The planning rules (duration weighting, tie-breaks, NTSC rationals,
 what blocks the fast path) are covered directly, as are the conversion rules
 (which container takes which codec as it is, which format needs which encoder,
 that mp4 to mp4 never hands ffmpeg the file it is reading), and every screen and

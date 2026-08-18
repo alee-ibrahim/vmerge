@@ -395,7 +395,12 @@ pub fn run(job: &Job, cancel: &AtomicBool, emit: &mut dyn FnMut(FetchEvent)) -> 
         Some(info) => {
             outcome.out_duration = info.duration;
             if info.width > 0 && info.height > 0 {
-                outcome.out_format = Some((info.width, info.height, info.fps));
+                // The size it will be displayed at, which for anamorphic footage is
+                // not the size in the file - and is what the plan line promised.
+                outcome.out_format = {
+                    let (width, height) = info.display_size();
+                    Some((width, height, info.fps))
+                };
             }
         }
         // An audio-only download has no video stream, so it is not a clip and

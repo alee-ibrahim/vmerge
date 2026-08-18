@@ -16,10 +16,20 @@ pub struct TargetOverride {
 }
 
 /// The one format every segment is made to share before joining.
+///
+/// `width` and `height` are the frame as *stored*, and `sar` is the shape of one
+/// pixel in it - so the picture on screen is `width * sar` by `height`. Two clips
+/// can only be joined if they agree about the shape of a pixel as well as the
+/// number of them, and there are two ways to reach that agreement: everything
+/// square, or everything already the same non-square shape. The second is worth
+/// having, because for anamorphic footage it is the difference between encoding a
+/// 350-wide frame and upscaling it to 764 for no new detail at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Target {
     pub width: u32,
     pub height: u32,
+    /// The pixel shape, as ffmpeg's `setsar` wants it. `(1, 1)` for square.
+    pub sar: (u32, u32),
     pub fps: f64,
     /// The rate as ffmpeg should be told it, e.g. "30000/1001".
     pub fps_expr: String,
@@ -30,14 +40,23 @@ pub struct Target {
 }
 
 impl Target {
+    /// How wide one stored pixel is compared to its height.
+    pub fn pixel_aspect(&self) -> f64 {
+        let (num, den) = self.sar;
+        if num == 0 || den == 0 { 1.0 } else { num as f64 / den as f64 }
+    }
+
+    /// The size the finished file will be *displayed* at, which is the only size
+    /// worth putting in front of anyone: it is what a player will report and what
+    /// the picture will look like.
+    pub fn display_size(&self) -> (u32, u32) {
+        let width = (self.width as f64 * self.pixel_aspect()).round().max(2.0) as u32;
+        (width + width % 2, self.height)
+    }
+
     pub fn label(&self) -> String {
-        format!(
-            "{}{}{} @ {} fps",
-            self.width,
-            crate::theme::glyph::TIMES,
-            self.height,
-            format::fps(self.fps)
-        )
+        let (width, height) = self.display_size();
+        format!("{width}{}{height} @ {} fps", crate::theme::glyph::TIMES, format::fps(self.fps))
     }
 
     pub fn channel_layout(&self) -> &'static str {
@@ -48,11 +67,24 @@ impl Target {
     ///
     /// Fit inside the target box and pad the rest black, so nothing is cropped
     /// and clips of a different shape still line up frame-for-frame.
+    ///
+    /// The fit is worked out from `dar` - the ratio the clip is *displayed* at -
+    /// and then divided back through the target's own pixel shape, because for
+    /// anamorphic footage the stored frame and the picture are not the same
+    /// rectangle. A 350x572 stream with 24:11 pixels is a 764x572 picture, so
+    /// fitting it by its stored numbers squeezes it into a third of its width.
+    /// `force_original_aspect_ratio=decrease` did exactly that - it measures the
+    /// stored frame - and the `setsar=1` that followed threw away the stretch that
+    /// would have put it right again.
     pub fn video_filter(&self) -> String {
+        // Commas inside min() are escaped, or the filter graph reads them as the
+        // end of the scale filter. Even numbers, because H.264 requires them.
+        let (sar_num, sar_den) = self.sar;
         format!(
-            "scale=w={w}:h={h}:force_original_aspect_ratio=decrease,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,\
-             setsar=1,fps={fps},format={pix}",
+            "scale=w=trunc(min({w}\\,{h}*dar*{sar_den}/{sar_num})/2)*2:\
+             h=trunc(min({h}\\,{w}*{sar_num}/{sar_den}/dar)/2)*2,\
+             setsar={sar_num}/{sar_den},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,\
+             fps={fps},format={pix}",
             w = self.width,
             h = self.height,
             fps = self.fps_expr,
@@ -77,6 +109,10 @@ pub fn can_stream_copy(clips: &[ClipInfo]) -> bool {
         c.video_codec == first.video_codec
             && c.width == first.width
             && c.height == first.height
+            // Same number of pixels is not the same picture unless the pixels are
+            // the same shape: two 350x572 streams, one anamorphic and one not, are
+            // a 764x572 picture and a 350x572 one.
+            && c.sample_aspect_raw == first.sample_aspect_raw
             && c.pix_fmt == first.pix_fmt
             && c.frame_rate_raw == first.frame_rate_raw
             && c.rotation == first.rotation
@@ -123,6 +159,28 @@ fn heaviest<K: Ord + Clone>(weights: &BTreeMap<K, f64>, prefer: impl Fn(&K) -> f
         .map(|(k, _)| k.clone())
 }
 
+/// The pixel shape every clip already agrees on, or `(1, 1)` when they do not.
+///
+/// Read from the verbatim ffprobe field rather than from the parsed ratio: "24:11"
+/// and "48:22" are the same shape, and treating them as different would only cost
+/// a needless normalisation, but comparing floats for equality to decide it would
+/// be worse.
+fn shared_pixel_shape(clips: &[ClipInfo]) -> (u32, u32) {
+    let Some(first) = clips.first() else {
+        return (1, 1);
+    };
+    if !clips.iter().all(|c| c.sample_aspect_raw == first.sample_aspect_raw) {
+        return (1, 1);
+    }
+    // Rotated footage has its pixel shape turned with it, and the raw field no
+    // longer describes what is on screen. Rare enough, and confusing enough, to
+    // leave to the square-pixel path.
+    if clips.iter().any(|c| c.rotation != 0) {
+        return (1, 1);
+    }
+    first.pixel_shape()
+}
+
 /// Works out the one shape and framerate everything gets converted to.
 ///
 /// Weighted by DURATION, not by file count: whichever format most of the actual
@@ -133,6 +191,16 @@ fn heaviest<K: Ord + Clone>(weights: &BTreeMap<K, f64>, prefer: impl Fn(&K) -> f
 pub fn target_format(clips: &[ClipInfo], over: Option<TargetOverride>) -> Target {
     let (mut width, mut height, mut fps);
 
+    // Everything anamorphic in the same way can stay that way: the frames are
+    // already a common shape, so they need no stretching to line up, and encoding
+    // a 350-wide frame beats upscaling it to 764 to invent nothing. Anything mixed
+    // has to be brought to square pixels, because that is the only shape a
+    // stretched clip and an unstretched one can both be made into.
+    //
+    // A size typed in by hand is a size on screen, so it means square pixels too.
+    let sar = if over.is_some() { (1, 1) } else { shared_pixel_shape(clips) };
+    let anamorphic = sar != (1, 1);
+
     if let Some(o) = over.filter(|o| o.width > 0 && o.height > 0) {
         width = o.width;
         height = o.height;
@@ -142,7 +210,13 @@ pub fn target_format(clips: &[ClipInfo], over: Option<TargetOverride>) -> Target
         let mut fps_weight: BTreeMap<String, f64> = BTreeMap::new();
         for c in clips {
             let seconds = c.duration.max(0.1);
-            *size_weight.entry((c.width, c.height)).or_insert(0.0) += seconds;
+            // Weighted by the size on screen rather than the size in the file,
+            // because for anamorphic footage those differ and what matters is how
+            // big the picture is. Where every clip shares one pixel shape the
+            // stored sizes are already comparable, and using them keeps the target
+            // at a size the footage actually has.
+            let size = if anamorphic { (c.width, c.height) } else { c.display_size() };
+            *size_weight.entry(size).or_insert(0.0) += seconds;
             *fps_weight.entry(format!("{:.3}", c.fps)).or_insert(0.0) += seconds;
         }
 
@@ -195,6 +269,7 @@ pub fn target_format(clips: &[ClipInfo], over: Option<TargetOverride>) -> Target
     Target {
         width,
         height,
+        sar,
         fps: (fps * 1000.0).round() / 1000.0,
         fps_expr: fps_expr(fps),
         // Everything is normalised to H.264 + AAC, the pair that plays
@@ -209,11 +284,14 @@ pub fn target_format(clips: &[ClipInfo], over: Option<TargetOverride>) -> Target
 
 /// When every clip is already the same format as every other, that format is
 /// the target and no pixels get touched at all - whatever the codec happens to
-/// be.
+/// be, and whatever shape its pixels are. Nothing is re-encoded on this path, so
+/// an anamorphic set stays anamorphic and keeps displaying correctly; the size
+/// reported is the one it displays at.
 pub fn pass_through_target(clip: &ClipInfo) -> Target {
     Target {
         width: clip.width,
         height: clip.height,
+        sar: clip.pixel_shape(),
         fps: clip.fps,
         fps_expr: fps_expr(clip.fps),
         video_codec: clip.video_codec.clone(),
@@ -230,6 +308,11 @@ pub fn clip_matches_target(clip: &ClipInfo, target: &Target) -> bool {
     clip.video_codec == target.video_codec
         && clip.width == target.width
         && clip.height == target.height
+        // Same number of pixels is only the same picture if they are the same
+        // shape. Where the target is square this excludes every anamorphic clip,
+        // and where the target is anamorphic it is what lets one straight through
+        // untouched.
+        && clip.pixel_shape() == target.sar
         && clip.pix_fmt == target.pix_fmt
         && clip.rotation == 0
         && (clip.fps - target.fps).abs() < 0.01
@@ -258,6 +341,8 @@ mod tests {
             width: w,
             height: h,
             pix_fmt: "yuv420p".into(),
+            sample_aspect_raw: "1:1".into(),
+            pixel_aspect: 1.0,
             fps,
             frame_rate_raw: format!("{}/1", fps as u32),
             rotation: 0,
@@ -317,6 +402,88 @@ mod tests {
     fn mixed_audio_rate_blocks_the_fast_path() {
         let mut clips = vec![clip(1920, 1080, 30.0, 5.0), clip(1920, 1080, 30.0, 5.0)];
         clips[1].sample_rate = 44_100;
+        assert!(!can_stream_copy(&clips));
+    }
+
+    /// 350x572 stored with 24:11 pixels is a 764x572 picture. Broadcast footage
+    /// like this is what "the resolution goes cramped after a merge" was: the
+    /// target was taken from the stored numbers and `setsar=1` then threw away the
+    /// stretch that made them a picture, squeezing it into a third of its width.
+    fn anamorphic(w: u32, h: u32, secs: f64) -> ClipInfo {
+        ClipInfo {
+            sample_aspect_raw: "24:11".into(),
+            pixel_aspect: 24.0 / 11.0,
+            ..clip(w, h, 25.0, secs)
+        }
+    }
+
+    #[test]
+    fn footage_that_is_all_anamorphic_the_same_way_stays_that_way() {
+        let clips = vec![anamorphic(350, 574, 90.0), anamorphic(350, 572, 80.0)];
+        let t = target_format(&clips, None);
+
+        // Encoded at the size it is stored at, not upscaled to the size it is
+        // shown at: 764 wide would be a third more pixels per row and not one more
+        // pixel of detail.
+        assert_eq!((t.width, t.height), (350, 574));
+        assert_eq!(t.sar, (24, 11));
+        // What it will be displayed at, which is what the plan line says.
+        assert_eq!(t.display_size(), (764, 574));
+        assert_eq!(t.label(), "764×574 @ 25 fps");
+
+        // The clip that is already exactly this goes through untouched; the other
+        // one is two rows short, so it converts.
+        assert!(clip_matches_target(&clips[0], &t));
+        assert!(!clip_matches_target(&clips[1], &t));
+
+        let filter = t.video_filter();
+        assert!(filter.contains("setsar=24/11"), "the shape is kept: {filter}");
+        assert!(filter.contains("dar"), "and the fit reads it: {filter}");
+        assert!(!filter.contains("force_original_aspect_ratio"), "{filter}");
+    }
+
+    /// One stretched clip and one square one cannot both keep their shape, so
+    /// everything is brought to square pixels at the size it displays at.
+    #[test]
+    fn mixing_pixel_shapes_normalises_to_square_ones() {
+        let clips = vec![anamorphic(350, 574, 90.0), clip(1280, 720, 25.0, 10.0)];
+        let t = target_format(&clips, None);
+
+        assert_eq!(t.sar, (1, 1));
+        assert_eq!((t.width, t.height), (764, 574), "the heaviest picture, in square pixels");
+        // And the anamorphic clip must not be copied into it: it has to be
+        // stretched first, or that half of the merge plays squeezed.
+        assert!(!clip_matches_target(&clips[0], &t));
+        assert!(t.video_filter().contains("setsar=1/1"), "{}", t.video_filter());
+    }
+
+    /// A size typed in by hand is a size on screen, so it means square pixels.
+    #[test]
+    fn a_size_asked_for_by_hand_is_a_displayed_size() {
+        let clips = vec![anamorphic(350, 574, 90.0)];
+        let t = target_format(&clips, Some(TargetOverride { width: 1280, height: 720, fps: 25.0 }));
+        assert_eq!((t.width, t.height), (1280, 720));
+        assert_eq!(t.sar, (1, 1));
+        assert_eq!(t.display_size(), (1280, 720));
+    }
+
+    /// Two clips anamorphic in the same way are identical, so the fast join still
+    /// applies and no pixel is touched at all. Two that differ only in pixel shape
+    /// are not identical, however alike their numbers look.
+    #[test]
+    fn the_fast_path_reads_the_pixel_shape_too() {
+        let mut clips = vec![anamorphic(350, 572, 5.0), anamorphic(350, 572, 5.0)];
+        assert!(can_stream_copy(&clips));
+
+        // Nothing is re-encoded on that path, so the target is the clip as it is -
+        // reported at the size it plays at.
+        let target = pass_through_target(&clips[0]);
+        assert_eq!((target.width, target.height), (350, 572));
+        assert_eq!(target.sar, (24, 11));
+        assert_eq!(target.display_size(), (764, 572));
+
+        clips[1].sample_aspect_raw = "1:1".into();
+        clips[1].pixel_aspect = 1.0;
         assert!(!can_stream_copy(&clips));
     }
 

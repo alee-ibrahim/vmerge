@@ -732,37 +732,28 @@ impl App {
         }
         let clips = self.clip_list();
         let auto = plan::target_format(&clips, None);
-        let biggest = clips
-            .iter()
-            .max_by_key(|c| c.width as u64 * c.height as u64)
-            .expect("clips is not empty");
-        let smallest = clips
-            .iter()
-            .min_by_key(|c| c.width as u64 * c.height as u64)
-            .expect("clips is not empty");
+        // Measured and offered as displayed sizes throughout: picking "the biggest
+        // clip" out of anamorphic footage by its stored numbers would offer a size
+        // that is not the size of anything on screen.
+        let area = |c: &ClipInfo| {
+            let (w, h) = c.display_size();
+            w as u64 * h as u64
+        };
+        let biggest = clips.iter().max_by_key(|c| area(c)).expect("clips is not empty");
+        let smallest = clips.iter().min_by_key(|c| area(c)).expect("clips is not empty");
 
         let describe = |c: &ClipInfo| {
-            format!(
-                "{}{}{} @ {} fps",
-                c.width,
-                crate::theme::glyph::TIMES,
-                c.height,
-                format::fps(c.fps)
-            )
+            format!("{} @ {} fps", c.dimensions(), format::fps(c.fps))
+        };
+        let fixed = |c: &ClipInfo| {
+            let (width, height) = c.display_size();
+            TargetChoice::Fixed(TargetOverride { width, height, fps: c.fps })
         };
 
         let choices = vec![
             TargetChoice::Auto,
-            TargetChoice::Fixed(TargetOverride {
-                width: biggest.width,
-                height: biggest.height,
-                fps: biggest.fps,
-            }),
-            TargetChoice::Fixed(TargetOverride {
-                width: smallest.width,
-                height: smallest.height,
-                fps: smallest.fps,
-            }),
+            fixed(biggest),
+            fixed(smallest),
             TargetChoice::Fixed(TargetOverride { width: 1920, height: 1080, fps: 30.0 }),
             TargetChoice::Fixed(TargetOverride { width: 1280, height: 720, fps: 30.0 }),
             TargetChoice::Custom,
