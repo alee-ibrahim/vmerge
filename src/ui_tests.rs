@@ -304,7 +304,8 @@ fn a_live_broadcast_says_it_is_live_and_that_it_runs_until_stopped() {
 
     app.handle_event(AppEvent::Fetch(FetchEvent::Title("26th Sitting".into())));
     app.handle_event(AppEvent::Fetch(FetchEvent::Note(
-        "This is live. It will keep recording until the broadcast ends or you stop it.".into(),
+        "This is live, so it is taken from the start of the broadcast rather than from now."
+            .into(),
     )));
     app.handle_event(AppEvent::Fetch(FetchEvent::Stage(crate::fetch::Stage::Recording)));
     app.handle_event(AppEvent::Fetch(FetchEvent::Progress {
@@ -319,6 +320,12 @@ fn a_live_broadcast_says_it_is_live_and_that_it_runs_until_stopped() {
     assert!(screen.contains("26th Sitting"), "got:\n{screen}");
     assert!(screen.contains("RECORDING  LIVE"), "got:\n{screen}");
     assert!(screen.contains("This is live"), "the note explains itself:\n{screen}");
+    // A note wider than the window loses its own ending, which is how the one
+    // that used to be here stopped saying "or you stop it" at all.
+    assert!(
+        screen.contains("rather than from now"),
+        "the note must fit the window:\n{screen}"
+    );
     // 322 of 1877 pieces. A real fraction of what has been broadcast so far,
     // which is the only thing a live download can honestly be measured against -
     // and it has to say that is what it is, or 17% reads as "nearly nothing yet"

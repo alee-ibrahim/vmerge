@@ -45,6 +45,7 @@
 //! leaves behind are joined into a playable file, so esc means "that is enough"
 //! rather than "throw away the hour you just waited for".
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -429,10 +430,15 @@ fn attempt(
 
     let live = source.live == Live::Now;
     if live {
+        // Two lines rather than one long one. The notes area draws whole lines
+        // and cuts whatever is wider than the window, so a single sentence this
+        // long loses its own ending on a terminal of ordinary width.
         emit(FetchEvent::Note(
-            "This is live. It is being taken from the start of the broadcast, and keeps \
-             recording until that ends or you stop it."
+            "This is live, so it is taken from the start of the broadcast rather than from now."
                 .into(),
+        ));
+        emit(FetchEvent::Note(
+            "It keeps going until the broadcast ends or you stop it.".into(),
         ));
     }
     emit(FetchEvent::Stage(if live { Stage::Recording } else { Stage::Downloading }));
@@ -795,6 +801,9 @@ fn download(
     let mut title: Option<String> = known_title.map(str::to_string);
     let mut stream = 0u32;
     let mut last_done = 0u64;
+    // The numbered lines, kept per stream so they can be added up. Empty for a
+    // download yt-dlp runs one stream at a time, which takes the path below it.
+    let mut streams: BTreeMap<u64, Progress> = BTreeMap::new();
 
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout);
@@ -818,11 +827,35 @@ fn download(
                 continue;
             };
 
+            // Only when the asking pass came back without one. For a live
+            // broadcast yt-dlp stamps the time onto the title it names the file
+            // after, while the progress lines carry the bare title without it -
+            // so both would be announced, as two spellings of one name, and the
+            // shorter would overwrite the one the file is actually called.
             if let Some(name) = &progress.title
+                && known_title.is_none()
                 && title.as_deref() != Some(name.as_str())
             {
                 title = Some(name.clone());
                 emit(FetchEvent::Title(name.clone()));
+            }
+
+            // Numbered lines are several downloads at once and are reported as
+            // their sum; unnumbered ones are one download at a time, where a
+            // count that goes backwards means the next stream has started.
+            if let Some(n) = progress.stream {
+                let finished = progress.status == Status::Finished;
+                streams.insert(n, progress);
+                if let Some(event) = combined(&streams) {
+                    emit(event);
+                }
+                // Only once every stream is in. The first of two finishing is
+                // not the download finishing, and saying so would put "putting
+                // it together" on screen with half of it still arriving.
+                if finished && streams.values().all(|p| p.status == Status::Finished) {
+                    emit(FetchEvent::Stage(Stage::Finishing));
+                }
+                continue;
             }
 
             match progress.status {
@@ -1041,9 +1074,73 @@ enum Status {
     Error,
 }
 
+/// What several streams arriving at once add up to.
+///
+/// A live recording downloads the picture and the sound side by side, and each
+/// reports on itself, so taking the newest line as the truth makes every figure
+/// on screen flip between two unrelated ones. Added together they are one
+/// download again.
+///
+/// The position is the exception: it is the *least* complete stream's, not the
+/// sum and not the average. What can be salvaged from a recording stopped half
+/// way is bounded by whichever of the two has less, so the honest answer to "how
+/// much of this sitting do I have" is the smaller of them.
+fn combined(streams: &BTreeMap<u64, Progress>) -> Option<FetchEvent> {
+    if streams.is_empty() {
+        return None;
+    }
+    let done = streams.values().map(|p| p.done).sum();
+    let rate = streams.values().map(|p| p.rate).sum();
+    let total = streams
+        .values()
+        .map(|p| p.total)
+        .try_fold(0u64, |sum, total| total.map(|t| sum + t))
+        .filter(|t| *t > 0);
+    let fragments = streams
+        .values()
+        .filter_map(|p| p.fragments)
+        .min_by(|(a_at, a_of), (b_at, b_of)| {
+            let left = *a_at as f64 / *a_of as f64;
+            let right = *b_at as f64 / *b_of as f64;
+            left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    // No estimate: two streams racing each other have no shared one, and a live
+    // broadcast has no end for either of them to be estimating towards.
+    Some(FetchEvent::Progress { done, total, rate, eta: None, fragments })
+}
+
+/// Splits the `2: ` yt-dlp writes in front of a progress line off the rest.
+///
+/// It numbers the lines it is keeping on screen when more than one download is
+/// running at once, and `--live-from-start` is exactly that case: the picture
+/// and the sound arrive together rather than one after the other. The template
+/// this program asks for is then no longer the start of the line, and requiring
+/// it to be threw away every progress report a live recording produced - which
+/// is how a recording that was working perfectly came to show `0 KB` and no bar
+/// for as long as anyone watched it.
+///
+/// The number is worth keeping rather than merely skipping, because it is what
+/// says which of two interleaved streams a line is talking about. Only a run of
+/// digits followed by `: ` counts, so a title beginning with something similar
+/// cannot be eaten by accident.
+fn split_stream_number(line: &str) -> (Option<u64>, &str) {
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return (None, line);
+    }
+    match line[digits..].strip_prefix(": ") {
+        Some(rest) => (line[..digits].parse().ok(), rest),
+        None => (None, line),
+    }
+}
+
 /// One parsed progress line.
 #[derive(Debug, Clone, PartialEq)]
 struct Progress {
+    /// Which of several interleaved downloads this line is about, when yt-dlp
+    /// is running more than one at a time. None when it is running one, which
+    /// is every download of a video that has finished being broadcast.
+    stream: Option<u64>,
     status: Status,
     done: u64,
     total: Option<u64>,
@@ -1064,7 +1161,8 @@ impl Progress {
     /// them on the first line of a live stream, so every value here is optional
     /// in practice even though the template always produces nine of them.
     fn parse(line: &str) -> Option<Self> {
-        let rest = line.trim().strip_prefix(PROGRESS_TAG)?.trim_start();
+        let (stream, rest) = split_stream_number(line.trim());
+        let rest = rest.strip_prefix(PROGRESS_TAG)?.trim_start();
         // The title goes last precisely because it is the one field that can
         // contain spaces, so the eight before it split off cleanly.
         let mut parts = rest.splitn(9, ' ');
@@ -1093,6 +1191,7 @@ impl Progress {
             .map(str::to_string);
 
         Some(Self {
+            stream,
             status,
             done,
             // A declared length is exact; an estimate is what a fragmented
@@ -1357,6 +1456,59 @@ mod tests {
             let line = format!("VMPROG downloading 1 NA NA 1 NA {index} {count} x");
             assert_eq!(Progress::parse(&line).unwrap().fragments, None, "{index}/{count}");
         }
+    }
+
+    /// yt-dlp numbers its progress lines when two downloads run at once, which
+    /// is every live recording. Missing this threw away every report one made.
+    #[test]
+    fn a_numbered_progress_line_is_still_a_progress_line() {
+        let plain = "VMPROG downloading 3089 NA NA 0 NA 322 1877 A Sitting";
+        let numbered = "2: VMPROG downloading 3089 NA NA 0 NA 322 1877 A Sitting";
+        // Identical in every respect but the number itself, which is the point:
+        // the prefix must change which stream a line is about and nothing else.
+        let with = Progress::parse(numbered).expect("the numbered form has to parse");
+        let without = Progress::parse(plain).expect("the plain form has to parse");
+        assert_eq!(Progress { stream: None, ..with.clone() }, without);
+        assert_eq!(Progress::parse(&format!("10: {plain}")).unwrap().done, 3089);
+
+        // The number says which stream, and is kept for that reason.
+        assert_eq!(Progress::parse(numbered).unwrap().stream, Some(2));
+        assert_eq!(Progress::parse(plain).unwrap().stream, None);
+
+        // Only a number and a colon-space, so nothing that merely looks like one
+        // takes a bite out of the line.
+        assert_eq!(split_stream_number("2: VMPROG x"), (Some(2), "VMPROG x"));
+        assert_eq!(split_stream_number("VMPROG x"), (None, "VMPROG x"));
+        assert_eq!(split_stream_number("2:VMPROG x"), (None, "2:VMPROG x"));
+        assert_eq!(split_stream_number("2 VMPROG x"), (None, "2 VMPROG x"));
+        assert_eq!(split_stream_number(""), (None, ""));
+    }
+
+    /// Two streams arriving at once are one download. Reported as they come,
+    /// every figure on screen flips between two unrelated ones.
+    #[test]
+    fn streams_arriving_together_are_added_up() {
+        let line = |n: u64, done: u64, at: u64, of: u64| {
+            Progress::parse(&format!("{n}: VMPROG downloading {done} NA NA 1000 NA {at} {of} T"))
+                .expect("a progress line")
+        };
+        let mut streams = BTreeMap::new();
+        streams.insert(1, line(1, 52_000_000, 560, 1877));
+        streams.insert(2, line(2, 37_000_000, 322, 1877));
+
+        let Some(FetchEvent::Progress { done, total, rate, eta, fragments }) = combined(&streams)
+        else {
+            panic!("two streams have a combined position");
+        };
+        assert_eq!(done, 89_000_000, "the bytes are the two of them together");
+        assert_eq!(rate, 2000.0);
+        assert_eq!(total, None, "neither declared a size, so there is no total");
+        assert_eq!(eta, None);
+        // The lower of the two: what can be salvaged is bounded by whichever
+        // stream has less of the sitting, not by the one that is ahead.
+        assert_eq!(fragments, Some((322, 1877)));
+
+        assert!(combined(&BTreeMap::new()).is_none(), "nothing yet is not a position");
     }
 
     #[test]

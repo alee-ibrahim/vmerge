@@ -246,6 +246,17 @@ size, so there is no byte total to draw from and no estimate worth printing;
 until the first counts arrive there is nothing honest to draw at all, and a
 travelling marker says "working" where a bar would have to invent a position.
 
+One live download is two: yt-dlp fetches the picture and the sound side by side,
+and each reports on itself. Taken as they come, every figure on screen flips
+between two unrelated ones, so they are added back into one — the bytes summed,
+and the position taken from whichever stream has *less*, because what can be
+salvaged from a recording stopped half way is bounded by the shorter of the two.
+yt-dlp also numbers its progress lines when it is running more than one download
+at once, which moves the template this program reads off the start of the line;
+missing that threw away every report a live recording made, which is how a
+recording that was working perfectly showed `0 KB` and no bar for as long as
+anyone watched it.
+
 `esc` means *finish* here rather than *cancel*. yt-dlp writes each stream to its
 own part-file and only joins them at the end, so stopping half way leaves the
 picture in one file, the sound in another, and no video at all — both complete as

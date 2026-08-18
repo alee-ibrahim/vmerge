@@ -263,21 +263,26 @@ pub fn download(tools: Arc<Tools>, options: Download) -> Result<bool> {
         }
         FetchEvent::Progress { done, total, rate, eta, fragments } => {
             if recording {
-                let through = match fragments {
+                let percent = match fragments {
                     Some((at, count)) if count > 0 => {
-                        format!("{:>3.0}%", (at as f64 / count as f64) * 100.0)
+                        ((at as f64 / count as f64) * 100.0) as u32
                     }
-                    _ => "  --".to_string(),
+                    _ => 0,
                 };
-                redraw(
-                    &format!(
-                        "  recording  {through} of the broadcast so far   {} at {}",
-                        format::size(done),
-                        format::rate(rate)
-                    ),
-                    false,
-                    tty,
+                let line = format!(
+                    "  recording  {percent:>3}% of the broadcast so far   {} at {}",
+                    format::size(done),
+                    format::rate(rate)
                 );
+                if tty {
+                    redraw(&line, false, tty);
+                } else if percent >= logged_percent + 5 {
+                    // A redirected run would otherwise say nothing at all
+                    // between starting and finishing, which for a recording that
+                    // can last hours is a log that proves nothing.
+                    logged_percent = percent - percent % 5;
+                    println!("{}", line.trim_end());
+                }
                 return;
             }
             let where_ = if finishing {
