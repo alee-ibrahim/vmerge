@@ -204,17 +204,6 @@ fn find_local(roots: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// Makes a freshly written file runnable. On Windows the bit does not exist; the
-/// SmartScreen mark does, and `proc::unblock` clears that instead.
-#[cfg(unix)]
-fn make_runnable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
-}
-
-#[cfg(not(unix))]
-fn make_runnable(_path: &Path) {}
-
 /// Days since 1970-01-01 for a proleptic Gregorian date.
 ///
 /// Howard Hinnant's `days_from_civil`. Exact, and short enough not to be worth a
@@ -323,9 +312,10 @@ fn install(root: &Path, reporter: &mut dyn Reporter) -> Result<PathBuf> {
     fs::rename(&staged, &installed)
         .with_context(|| format!("installing {}", installed.display()))?;
     // A fresh download carries the mark that makes SmartScreen interrupt its
-    // first run, and this one is about to be run without anyone watching.
-    proc::unblock(&installed);
-    make_runnable(&installed);
+    // first run - Gatekeeper refuses to run it at all - and this one is about to
+    // be run without anyone watching. It also arrives without the executable
+    // bit, which off Windows is the difference between working and not.
+    proc::make_installed_runnable(&installed);
     // Just installed, so it is as current as it can be: start the clock now
     // rather than updating it again on the very first download.
     touch_stamp(&installed);

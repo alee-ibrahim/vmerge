@@ -32,9 +32,106 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # Not a test run: this only proves the non-Windows fallbacks still compile, so
-  # that reaching for a Windows API without a #[cfg] guard fails here rather than
-  # in someone's editor.
+  # macOS is a platform this tool runs on rather than one it merely compiles
+  # for, so it gets what Windows gets. The runners are Apple Silicon, which is
+  # the build that ships, and the arm64-only paths - the ad-hoc signature a
+  # downloaded ffmpeg needs before it will execute at all, quarantine removal,
+  # the Mach-O header the updater checks - exist nowhere else.
+  test-macos:
+    name: Test and Clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # The one thing unit tests cannot cover: whether a real first run on a real
+  # Mac ends with an ffmpeg that actually executes. Every way this can fail -
+  # a moved download URL, a rebuilt binary behind a pinned hash, quarantine, a
+  # missing signature - shows up here and nowhere else.
+  setup-macos:
+    name: Downloaded tools run (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Install ffmpeg from a clean state, then run it
+        run: |
+          set -euo pipefail
+
+          # An ffmpeg already on PATH would be found and reported as success
+          # setup never earned, so it is hidden for the length of this step.
+          mkdir -p "$RUNNER_TEMP/nothing" "$RUNNER_TEMP/clips"
+          rm -rf target/release/ffmpeg "$HOME/Library/Application Support/video-merge"
+
+          # Tools are resolved before any of the job branches, so this installs
+          # ffmpeg and then exits complaining there is nothing to merge. The
+          # complaint is expected; what matters is what it left on disk.
+          PATH="$RUNNER_TEMP/nothing:/usr/bin:/bin:/usr/sbin:/sbin" \
+            ./target/release/vmerge --no-tui --no-update --folder "$RUNNER_TEMP/clips" || true
+
+          bin=target/release/ffmpeg/bin
+          for tool in ffmpeg ffprobe; do
+            test -x "$bin/$tool" || { echo "::error::$tool was not installed"; exit 1; }
+          done
+
+          # The real assertion. An unsigned or quarantined arm64 binary is
+          # killed by the kernel before main, so this line failing is exactly
+          # the Gatekeeper problem it is here to catch.
+          "$bin/ffmpeg" -version | head -1
+          "$bin/ffprobe" -version | head -1
+
+      # yt-dlp is the other binary this downloads and then runs, and it is the
+      # more delicate of the two: yt-dlp_macos is a PyInstaller one-file build,
+      # carrying an archive appended after the Mach-O image. The ad-hoc
+      # codesign applied to everything installed runs straight across that, and
+      # a signature that lands but invalidates the appended archive would leave
+      # a tool that installs perfectly and then will not start.
+      #
+      # This applies the three steps proc::make_installed_runnable performs
+      # rather than driving the installer itself, because that installer asks
+      # api.github.com which release is newest, and Actions runners share an IP
+      # pool that endpoint rate-limits - the request is refused in under a
+      # second, which would make this a coin toss rather than a check. The
+      # download URL below needs no API call, so what is left is deterministic
+      # and is the part that could actually be wrong.
+      - name: Ad-hoc signing leaves yt-dlp runnable
+        run: |
+          set -euo pipefail
+
+          curl -sSL --retry 3 --max-time 300 \
+            -o "$RUNNER_TEMP/yt-dlp" \
+            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos
+
+          file "$RUNNER_TEMP/yt-dlp"
+
+          # Exactly what proc::make_installed_runnable does, in the same order.
+          xattr -d com.apple.quarantine "$RUNNER_TEMP/yt-dlp" 2>/dev/null || true
+          chmod 0755 "$RUNNER_TEMP/yt-dlp"
+          codesign --force --sign - "$RUNNER_TEMP/yt-dlp"
+
+          # A PyInstaller binary whose appended archive was invalidated by that
+          # signature starts and dies here.
+          "$RUNNER_TEMP/yt-dlp" --version
+
+  # Not a test run: this only proves the fallbacks for platforms without a build
+  # of their own still compile, so that reaching for a Windows or macOS API
+  # without a #[cfg] guard fails here rather than in someone's editor.
   portability:
     name: Compiles on Linux
     runs-on: ubuntu-latest
@@ -45,9 +142,10 @@ jobs:
       - run: cargo check --all-targets
 
 # Miri is deliberately absent. Every unsafe block in the crate is in src/proc.rs
-# and every one of them is #[cfg(windows)] - SetFileAttributesW, the job object
-# that stops a child taking its own children with it, and the ctrl-c handler - so
-# on a Linux runner Miri would have nothing to check; it cannot evaluate FFI
+# and all but one are #[cfg(windows)] - SetFileAttributesW, the job object that
+# stops a child taking its own children with it, and the ctrl-c handler; the
+# remaining one is the macOS removexattr call. So on a Linux runner Miri would
+# have nothing to check; it cannot evaluate FFI
 # calls in any case. It would also fail as written: the ffmpeg and merge tests
 # write real files, and Miri blocks filesystem access unless it is run with
 # -Zmiri-disable-isolation. If it is ever worth adding, it needs both that flag

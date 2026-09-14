@@ -241,6 +241,13 @@ pub struct ChipStyle {
 fn lift(colour: Color) -> Color {
     match colour {
         Color::Rgb(r, g, b) => Color::Rgb(lift_channel(r), lift_channel(g), lift_channel(b)),
+        // The ANSI palette lays its ground as Reset - "whatever the terminal
+        // already is" - so without an arm here a row sitting on `base` or
+        // `surface` lifts to itself and hover becomes invisible. That is every
+        // terminal not announcing true colour, macOS Terminal.app among them.
+        // DarkGray is the step Black already takes, and reads as a layer
+        // against a dark terminal theme or a light one.
+        Color::Reset => Color::DarkGray,
         Color::Black => Color::DarkGray,
         Color::DarkGray => Color::Gray,
         Color::Gray => Color::White,

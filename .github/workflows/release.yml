@@ -1,0 +1,114 @@
+# Builds the binaries a release is made of and attaches them to it.
+#
+# Before this existed the Windows exe was built by hand and uploaded by hand,
+# which is workable for one platform and stops being workable at two: the point
+# of a release is that every platform's build came from the same commit, and
+# only automation can promise that.
+#
+# The `.sha256` beside each binary is not decoration. src/update.rs prefers a
+# published digest over the length GitHub declares, and it is the one check in
+# the updater that would still catch someone with write access to the release
+# but not to the tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be rebuilt without moving the tag, which is the sane way to
+  # recover from a runner failure.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to build and upload
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing should not throw away a build that succeeded: the
+      # release is assembled from whatever arrives, and a missing asset is
+      # easier to see than a half-finished run.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            runner: windows-latest
+            # The name people have been double-clicking since before there was
+            # a workflow. It stays exactly as it was.
+            asset: MERGE-VIDEOS.exe
+            built: target/release/vmerge.exe
+          - name: macOS arm64
+            runner: macos-latest
+            asset: MERGE-VIDEOS-macos-arm64
+            built: target/release/vmerge
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      # An arm64 binary that carries no signature at all is killed by the
+      # kernel before it starts. The linker normally ad-hoc signs it already;
+      # this makes that a promise rather than a default we are relying on.
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - "${{ matrix.built }}"
+
+      - name: Name it, and publish its digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "${{ matrix.built }}" "dist/${{ matrix.asset }}"
+          cd dist
+          # Bare digest, no filename: what update.rs reads is the first word.
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+
+      # The notes are written here rather than by hand at tag time, because a
+      # release page listing four files and no instructions is a release nobody
+      # can install. Both matrix jobs set the same body against the same tag, so
+      # whichever lands second changes nothing.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            ## Install
+
+            **macOS (Apple Silicon)** — paste this into Terminal:
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/alee-ibrahim/vmerge/main/install.sh | sh
+            ```
+
+            It fetches the build for your Mac, checks it against the digest
+            published beside it, and sets up ffmpeg. Then run `vmerge`.
+
+            **Windows** — download `MERGE-VIDEOS.exe` below and run it.
+
+            ---
+
+            Every binary has a `.sha256` beside it. The macOS build is not
+            notarised, so downloading it by hand needs `chmod +x` and
+            `xattr -cr` before it will run — the installer above avoids both.
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256

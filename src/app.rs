@@ -1387,7 +1387,7 @@ pub fn parse_target_spec(text: &str) -> Option<(u32, u32, Option<f64>)> {
     Some((width, height, fps))
 }
 
-/// Shows the finished file in Explorer.
+/// Shows the finished file in the system's file manager.
 fn reveal(path: &Path) {
     #[cfg(windows)]
     {
@@ -1398,8 +1398,16 @@ fn reveal(path: &Path) {
         command.raw_arg(format!("/select,\"{}\"", path.display()));
         let _ = command.spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
+        // `open -R` is Finder's own reveal: it opens the folder *and* selects
+        // the file, which is what Explorer's /select does and what the person
+        // who just made this file wants to see.
+        let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // No portable way to select a file, so the folder is the best on offer.
         if let Some(folder) = path.parent() {
             let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
         }

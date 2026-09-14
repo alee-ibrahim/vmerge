@@ -111,8 +111,88 @@ pub fn unblock(path: &Path) {
     let _ = std::fs::remove_file(Path::new(&stream));
 }
 
-#[cfg(not(windows))]
+/// macOS marks anything downloaded with a `com.apple.quarantine` extended
+/// attribute, and Gatekeeper refuses to execute a file carrying it: the same job
+/// Zone.Identifier does on Windows, done with an xattr instead of a stream.
+/// Removing it is what `xattr -d com.apple.quarantine` does, and removexattr is
+/// called directly so this does not depend on /usr/bin/xattr existing.
+#[cfg(target_os = "macos")]
+pub fn unblock(path: &Path) {
+    use std::ffi::{CString, c_char};
+    use std::os::unix::ffi::OsStrExt;
+
+    // No #[link]: this lives in libSystem, which std has already linked, so
+    // naming a library here could only get it wrong.
+    unsafe extern "C" {
+        fn removexattr(path: *const c_char, name: *const c_char, options: i32) -> i32;
+    }
+
+    let (Ok(path), Ok(name)) = (
+        CString::new(path.as_os_str().as_bytes()),
+        CString::new("com.apple.quarantine"),
+    ) else {
+        return;
+    };
+    // Best effort, exactly like the Windows side: a file that never carried the
+    // attribute fails with ENOATTR, which is the state we wanted anyway.
+    unsafe {
+        removexattr(path.as_ptr(), name.as_ptr(), 0);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn unblock(_path: &Path) {}
+
+/// Makes a freshly written file runnable.
+///
+/// Extraction writes entries with `File::create`, which is 0644 — so a binary
+/// that was executable inside the archive arrives without the bit and cannot be
+/// run. On Windows the bit does not exist and there is nothing to do.
+#[cfg(unix)]
+pub fn make_runnable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+}
+
+#[cfg(not(unix))]
+pub fn make_runnable(_path: &Path) {}
+
+/// Gives a binary an ad-hoc signature, which on Apple Silicon is what makes it
+/// runnable at all.
+///
+/// arm64 macOS refuses to execute an unsigned binary outright — the kernel kills
+/// it before `main`, and the error says nothing useful about why. A downloaded
+/// ffmpeg therefore has to be signed locally, and `codesign -s -` is the
+/// signature that needs no certificate and no developer account. osxexperts,
+/// who publish the builds this installs, document exactly this step.
+///
+/// Best effort: where the binary is already signed, or the command line tools
+/// are absent, this changes nothing and the caller finds out the usual way —
+/// by running it.
+#[cfg(target_os = "macos")]
+pub fn ad_hoc_sign(path: &Path) {
+    let _ = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ad_hoc_sign(_path: &Path) {}
+
+/// Everything a freshly installed binary needs before it can be executed.
+///
+/// The three steps are one idea — "this arrived from the internet, make it
+/// runnable" — and every install path wants all three, so they travel together
+/// rather than being remembered separately at each call site.
+pub fn make_installed_runnable(path: &Path) {
+    unblock(path);
+    make_runnable(path);
+    ad_hoc_sign(path);
+}
 
 /// A child process and everything it goes on to start, killable as one thing.
 ///

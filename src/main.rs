@@ -31,6 +31,7 @@ mod fetch;
 mod ffmpeg;
 mod format;
 mod input;
+mod menu;
 mod merge;
 mod oneshot;
 mod plan;
@@ -158,7 +159,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn real_main(args: Args) -> Result<bool> {
+fn real_main(mut args: Args) -> Result<bool> {
     banner();
 
     let mut reporter = SetupReporter::new();
@@ -191,6 +192,35 @@ fn real_main(args: Args) -> Result<bool> {
             }
             update::Outcome::Failed(version) => stale_version = Some(version),
             update::Outcome::UpToDate => {}
+        }
+    }
+
+    // Asked here, and not sooner: an update replaces this process, so a choice
+    // made before it would be thrown away along with everything else. Asked
+    // before ffmpeg is looked for, so that someone who only wants to quit is
+    // not held up by a 40 MB download first.
+    //
+    // The answer is written back into `args` rather than acted on, so that
+    // everything after this runs exactly as it would have had the flags been
+    // typed.
+    if menu::wanted(
+        args.files.is_empty(),
+        args.folder.is_some(),
+        args.download.is_some(),
+        args.file_list.is_some(),
+        args.convert_to.is_some(),
+        args.no_tui,
+    ) {
+        match menu::ask() {
+            menu::Choice::Merge { folder } => args.folder = Some(folder),
+            menu::Choice::Download { url, folder } => {
+                args.download = Some(url);
+                args.folder = Some(folder);
+            }
+            menu::Choice::Quit => {
+                println!();
+                return Ok(true);
+            }
         }
     }
 

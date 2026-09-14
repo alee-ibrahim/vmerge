@@ -15,11 +15,12 @@
 //!   greater than this build. A tag nobody can read is refused rather than
 //!   guessed at, so a renamed or malformed release cannot install an older
 //!   binary over a newer one.
-//! * **Verified before it is swapped in.** The declared length, a Windows
-//!   executable header, and a SHA-256 whenever the release publishes one beside
-//!   the exe as `MERGE-VIDEOS.exe.sha256`. Publishing that file is worth the
-//!   half-second it takes: it is the only check here that would survive someone
-//!   with write access to the release but not to the tag.
+//! * **Verified before it is swapped in.** The declared length, an executable
+//!   header for the platform being installed — `MZ` on Windows, Mach-O on macOS
+//!   — and a SHA-256 whenever the release publishes one beside the binary as
+//!   `<asset>.sha256`. Publishing that file is worth the half-second it takes:
+//!   it is the only check here that would survive someone with write access to
+//!   the release but not to the tag.
 //! * **Failing changes nothing.** No network, a rate-limited API, an asset host
 //!   that stalls — documented as intermittent for GitHub releases, which is why
 //!   ffmpeg is mirrored elsewhere in this crate — or a folder that cannot be
@@ -40,7 +41,14 @@
 //! but it *can* be renamed out of the way, which frees its name for the new
 //! file. Both moves are on one volume, so the name is never pointing at nothing.
 //! The old image is hidden and swept up on a later start, because nothing can
-//! delete it while it is still the process doing the deleting.
+//! delete it while it is still the process doing the deleting. Unix would allow
+//! the simpler unlink-and-replace, but the rename works there too and one path
+//! through this is easier to be sure of than two.
+//!
+//! What the new file needs before it can be run differs by platform, and off
+//! Windows it needs something: the executable bit, and on macOS release from
+//! quarantine and an ad-hoc signature. `swap_in` does that before returning, so
+//! an update can never leave behind a binary that cannot start.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -61,7 +69,19 @@ const REPO: &str = "alee-ibrahim/vmerge";
 const LATEST_RELEASE: &str = "https://api.github.com/repos/alee-ibrahim/vmerge/releases/latest";
 
 /// The asset to install, and the name its digest would be published under.
+///
+/// One release carries a build per platform, so the name has to say which. A
+/// build that reached for the wrong one would download something that cannot
+/// run and then replace itself with it, which is why this is decided at compile
+/// time rather than picked from the release listing.
+#[cfg(windows)]
 const ASSET: &str = "MERGE-VIDEOS.exe";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ASSET: &str = "MERGE-VIDEOS-macos-arm64";
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const ASSET: &str = "MERGE-VIDEOS-macos-x86_64";
+#[cfg(not(any(windows, target_os = "macos")))]
+const ASSET: &str = "MERGE-VIDEOS-linux-x86_64";
 
 /// Set on the executable we hand over to, so the new version does not open by
 /// checking for an update all over again. A loop of relaunches would be the one
@@ -241,7 +261,30 @@ fn looks_executable(path: &Path) -> bool {
         .is_ok_and(|()| &header == b"MZ")
 }
 
-#[cfg(not(windows))]
+/// The same check for Mach-O, which is what a macOS build is.
+///
+/// Four magic numbers rather than one: 64-bit thin binaries are `MH_MAGIC_64`
+/// either way round, and a universal binary starts with a fat header instead —
+/// this build ships thin arm64, but a fat one is still a real executable and
+/// refusing it would be wrong.
+#[cfg(target_os = "macos")]
+fn looks_executable(path: &Path) -> bool {
+    use std::io::Read;
+
+    const MAGICS: [[u8; 4]; 4] = [
+        0xfeed_facfu32.to_le_bytes(), // MH_MAGIC_64
+        0xfeed_facfu32.to_be_bytes(), // MH_CIGAM_64
+        0xcafe_babeu32.to_be_bytes(), // FAT_MAGIC
+        0xcafe_babfu32.to_be_bytes(), // FAT_MAGIC_64
+    ];
+
+    let mut header = [0u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| MAGICS.contains(&header))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn looks_executable(_path: &Path) -> bool {
     true
 }
@@ -514,6 +557,12 @@ fn swap_in(exe: &Path, staged: &Path) -> Result<()> {
             let _ = fs::rename(&previous, exe);
             return Err(error).with_context(|| format!("installing the new {}", exe.display()));
         }
+        // The replacement was written by this process from a download, so off
+        // Windows it has neither the executable bit nor a signature and macOS
+        // still holds it in quarantine. Without this the update succeeds and the
+        // program can never be started again, which is the worst outcome the
+        // updater has - so it happens before anything hands over to it.
+        proc::make_installed_runnable(exe);
         return Ok(());
     }
     Err(last.unwrap_or_else(|| std::io::Error::other("no name to move the old version to")))
@@ -589,12 +638,17 @@ mod tests {
         )
     }
 
-    const GOOD_URL: &str =
-        "https://github.com/alee-ibrahim/vmerge/releases/download/v0.2.0/MERGE-VIDEOS.exe";
+    /// The release asset URL for whatever platform the tests are running on.
+    /// Built from `ASSET` rather than written out, so these stay true on a
+    /// platform whose build is not the Windows one.
+    fn good_url() -> String {
+        format!("https://github.com/alee-ibrahim/vmerge/releases/download/v0.2.0/{ASSET}")
+    }
 
     #[test]
     fn a_release_is_read_from_the_api_answer() {
-        let json = payload("v0.2.0", &asset_with_id("MERGE-VIDEOS.exe", GOOD_URL, 4_254_720, 7), "");
+        let good_url = good_url();
+        let json = payload("v0.2.0", &asset_with_id(ASSET, &good_url, 4_254_720, 7), "");
         let latest = read_release(&json).expect("a usable release");
         assert_eq!(latest.version, version(0, 2, 0));
         assert_eq!(latest.size, 4_254_720);
@@ -606,7 +660,7 @@ mod tests {
             latest.urls,
             vec![
                 "https://api.github.com/repos/alee-ibrahim/vmerge/releases/assets/7".to_string(),
-                GOOD_URL.to_string(),
+                good_url,
             ]
         );
     }
@@ -617,8 +671,8 @@ mod tests {
             "v0.2.0",
             &format!(
                 "{},{}",
-                asset_with_id("MERGE-VIDEOS.exe", GOOD_URL, 10, 7),
-                asset_with_id("MERGE-VIDEOS.exe.sha256", &format!("{GOOD_URL}.sha256"), 65, 8)
+                asset_with_id(ASSET, &good_url(), 10, 7),
+                asset_with_id(&format!("{ASSET}.sha256"), &format!("{}.sha256", good_url()), 65, 8)
             ),
             "",
         );
@@ -632,14 +686,17 @@ mod tests {
     fn releases_that_cannot_be_trusted_are_refused() {
         let cases = [
             // Not finished, so not for anyone yet.
-            (payload("v0.2.0", &asset(ASSET, GOOD_URL, 10), r#""draft":true,"#), "finished"),
-            (payload("v0.2.0", &asset(ASSET, GOOD_URL, 10), r#""prerelease":true,"#), "finished"),
+            (payload("v0.2.0", &asset(ASSET, &good_url(), 10), r#""draft":true,"#), "finished"),
+            (payload("v0.2.0", &asset(ASSET, &good_url(), 10), r#""prerelease":true,"#), "finished"),
             // A tag this build cannot compare is not evidence of anything.
-            (payload("nightly", &asset(ASSET, GOOD_URL, 10), ""), "not a version"),
+            (payload("nightly", &asset(ASSET, &good_url(), 10), ""), "not a version"),
             // Nothing to install.
-            (payload("v0.2.0", &asset("source.zip", GOOD_URL, 10), ""), "no MERGE-VIDEOS.exe"),
+            (
+                payload("v0.2.0", &asset("source.zip", &good_url(), 10), ""),
+                &format!("no {ASSET}") as &str,
+            ),
             // A length of nothing cannot be checked against.
-            (payload("v0.2.0", &asset(ASSET, GOOD_URL, 0), ""), "declares no length"),
+            (payload("v0.2.0", &asset(ASSET, &good_url(), 0), ""), "declares no length"),
             // No route left: an off-repository URL and no asset id to fall back
             // on. Refused rather than fetched from wherever it points.
             (
@@ -657,7 +714,7 @@ mod tests {
     #[test]
     fn the_download_has_to_come_from_this_repository() {
         for good in [
-            GOOD_URL,
+            &good_url(),
             "https://github.com/alee-ibrahim/vmerge/releases/download/v9.9.9/MERGE-VIDEOS.exe",
             "https://api.github.com/repos/alee-ibrahim/vmerge/releases/assets/511965178",
         ] {

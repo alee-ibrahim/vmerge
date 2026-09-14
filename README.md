@@ -30,26 +30,88 @@ cargo +nightly miri-test
 ```
 
 The Miri alias disables isolation because the ffmpeg and merge tests write real
-files. Miri is not part of CI, and is unlikely to earn its place: the crate has exactly
-one `unsafe` block — the `SetFileAttributesW` call in `src/proc.rs` — and it is
-`#[cfg(windows)]`, so a Linux runner would have nothing to check. Miri cannot
-evaluate FFI calls either way.
+files. Miri is not part of CI, and is unlikely to earn its place: every `unsafe`
+block in the crate is in `src/proc.rs`, and all but one are `#[cfg(windows)]`
+(the exception is the macOS `removexattr` call), so a Linux runner would have
+nothing to check. Miri cannot evaluate FFI calls either way.
 
-The binary is `target/release/vmerge.exe`. Copy it to the project root as
-`MERGE-VIDEOS.exe` to get a friendly drag-and-drop target:
+## Installing
+
+Releases carry a build per platform, built from one commit by
+[`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+| Platform | Asset |
+| --- | --- |
+| Windows x86_64 | `MERGE-VIDEOS.exe` |
+| macOS Apple Silicon | `MERGE-VIDEOS-macos-arm64` |
+
+**On Windows**, download it and run it.
+
+**On macOS**, one line:
+
+```
+curl -fsSL https://raw.githubusercontent.com/alee-ibrahim/vmerge/main/install.sh | sh
+```
+
+That fetches the build for this Mac, checks it against the digest published
+beside it, installs it to `~/.local/bin/vmerge`, and fetches ffmpeg so the first
+merge starts immediately rather than pausing for a download. `VMERGE_PREFIX`
+picks a different folder; `VMERGE_REPO` a different repository.
+
+### Why a pipe rather than a file to download
+
+Not to be clever, and not to get around Gatekeeper. macOS quarantines anything a
+browser saves, refuses to run it, and passes the mark on to everything unpacked
+from it - so a downloaded zip *cannot* contain a script that clears its own
+quarantine, because the script is quarantined too. Nothing inside the mark can
+lift it.
+
+curl sets no such mark, which makes the pipe the only shape that can do this
+setup at all. The alternative is notarising the build, which needs a paid Apple
+developer account; until someone is paying for one, this is the honest option.
+
+The script refuses to install anything whose checksum does not match, and is
+wrapped in a function called on its last line, so a connection cut halfway
+leaves a truncated file that does nothing rather than a half-run install.
+
+**By hand instead**, if you would rather not pipe a script into a shell - which
+is a perfectly reasonable thing to prefer. Download `MERGE-VIDEOS-macos-arm64`
+from the releases page, then:
+
+```
+chmod +x MERGE-VIDEOS-macos-arm64
+xattr -cr MERGE-VIDEOS-macos-arm64
+./MERGE-VIDEOS-macos-arm64
+```
+
+The `xattr` line is clearing exactly the mark described above. It is the same
+step the ffmpeg builds this installs ask for, and it is macOS doing the honest
+thing: nobody has vouched for this binary, and it is saying so. The program
+clears the same mark from the tools it downloads itself, so this is the only
+time it has to be done by hand.
+
+### Building it yourself
+
+The binary is `target/release/vmerge` (`vmerge.exe` on Windows). On Windows,
+copy it to the project root as `MERGE-VIDEOS.exe` to get a friendly
+drag-and-drop target:
 
 ```
 copy target\release\vmerge.exe MERGE-VIDEOS.exe
 ```
 
-The built exe is deliberately not committed — it changes on every build, so
+The built binary is deliberately not committed — it changes on every build, so
 tracking it would grow the history with each commit. The vendored ffmpeg archive
 is committed because it changes once or twice a year.
 
-ffmpeg is found in `PATH`, in an `ffmpeg\bin` folder beside the executable, or
-in `%LOCALAPPDATA%\video-merge`. If none of those has it, it is downloaded and
-unpacked on first run — no admin rights, nothing installed system-wide. Both
-steps report themselves, using the same eighth-block bar as the merge screen:
+## First-run setup
+
+ffmpeg is found in `PATH`, in an `ffmpeg/bin` folder beside the executable, or
+in the per-user folder for the platform — `%LOCALAPPDATA%\video-merge` on
+Windows, `~/Library/Application Support/video-merge` on macOS. If none of those
+has it, it is downloaded and unpacked on first run — no admin rights, nothing
+installed system-wide. Both steps report themselves, using the same eighth-block
+bar as the merge screen:
 
 ```
   Downloading ffmpeg from this project's mirror - this happens once
@@ -64,7 +126,7 @@ the zip is 106. A transfer that stops short is caught there rather than
 surfacing later as a corrupt archive, and with output redirected each step
 prints a line every 25% instead of a bar it cannot draw.
 
-### Which build, and why
+### Which build, and why — Windows
 
 ffmpeg.org publishes no Windows binaries of its own; its download page points at
 two third-party builders, [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and
@@ -112,6 +174,44 @@ rest to unpack it.
 
 `FFmpeg/FFmpeg` on GitHub is source only: no releases, no binary assets. Using
 it would mean compiling ffmpeg and libx264 on the user's machine.
+
+### Which build, and why — macOS
+
+The choice here is much narrower than on Windows. ffmpeg.org publishes no macOS
+binaries either; BtbN builds only Windows and Linux; and
+[evermeet.cx](https://evermeet.cx/ffmpeg/), the long-standing macOS builder,
+states outright that it will not build for Apple Silicon.
+[osxexperts.net](https://www.osxexperts.net/) is the one publisher of static
+arm64 builds, so that is where setup fetches from — ffmpeg 9.0 on Apple Silicon,
+8.0 on Intel.
+
+It ships each tool in its own archive, which is why a download source declares
+what it provides and setup keeps taking sources until it has both. On Windows
+one archive still supplies both and setup still stops at the first one that
+works.
+
+These archives are pinned, and pinned at the *binary* rather than at the
+archive: the URLs carry the major version, so unlike gyan.dev their contents do
+not drift, and the digest osxexperts publishes is of the executable inside. That
+is also the better thing to check — it is the file that gets run, and a
+publisher who re-zips identical contents has not tampered with anything. The
+cost is that the next major release lands at a new URL, and moving to it means
+changing the URL and the hash together, exactly as refreshing the Windows mirror
+does.
+
+Two things happen to a downloaded binary on macOS that have no Windows
+equivalent, and without either it does not run:
+
+* The `com.apple.quarantine` attribute is removed. This is the same job
+  Zone.Identifier does on Windows, and `src/proc.rs` handles both behind one
+  `unblock`.
+* It is given an ad-hoc signature with `codesign -s -`. An arm64 binary with no
+  signature at all is killed by the kernel before `main`, and nothing in the
+  error explains why.
+
+Both run on every binary this installs — ffmpeg, ffprobe and yt-dlp alike — and
+`setup-macos` in CI proves it on a real Apple Silicon runner by installing from
+a clean state and then executing what it installed.
 
 ## Using it
 
