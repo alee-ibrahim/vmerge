@@ -495,6 +495,8 @@ fn unpack_7z(archive_path: &Path, stage: &Path, reporter: &mut dyn Reporter) -> 
         .map_err(|e| anyhow::anyhow!("reading the downloaded archive: {e}"))?;
     let total: u64 = listing.files.iter().filter(|f| !f.is_directory).map(|f| f.size).sum();
 
+    use sevenz_rust2::EntryDecision;
+
     let mut reader = sevenz_rust2::ArchiveReader::open(archive_path, Default::default())
         .map_err(|e| anyhow::anyhow!("opening the downloaded archive: {e}"))?;
 
@@ -504,20 +506,22 @@ fn unpack_7z(archive_path: &Path, stage: &Path, reporter: &mut dyn Reporter) -> 
     reporter.progress(0, Some(total));
 
     reader
-        .for_each_entries(|entry, data| {
+        .for_each_entries_with_decision(|entry, data| {
             let path = PathBuf::from(entry.name.replace('\\', "/"));
             if entry.is_directory {
-                return Ok(true);
+                return Ok(EntryDecision::Continue);
             }
             match write_entry(stage, &path, data) {
                 Ok(bytes) => {
                     written += bytes;
                     reporter.progress(written.min(total), Some(total));
-                    Ok(true)
+                    Ok(EntryDecision::Continue)
                 }
                 Err(e) => {
+                    // Stop outright: since sevenz-rust2 0.25 a plain `false`
+                    // only skips the rest of the block and carries on.
                     failure = Some(e);
-                    Ok(false)
+                    Ok(EntryDecision::Stop)
                 }
             }
         })
